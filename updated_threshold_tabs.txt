@@ -1,0 +1,66 @@
+# Create tabs for different sections of the app
+tab1, tab2, tab3 = st.tabs(["Overview", "Volatility Regimes", "Shock Simulation"])
+
+# --- Overview Tab ---
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs. Hybrid Approach")
+    st.markdown("""...<rest of markdown explanation>...""")
+
+# --- Volatility Regimes Tab ---
+with tab2:
+    st.header(f"Volatility Regimes for {selected_ccy}")
+    fig = px.scatter(dfc, x='Date', y='DailyVol', color='RegimeName',
+                     title=f"{selected_ccy}: Daily Volatility by Regime",
+                     labels={"DailyVol": "Daily Volatility", "RegimeName": "Regime"})
+    fig.update_traces(marker=dict(size=5))
+    fig.update_layout(legend_title_text="Regime", xaxis_title=None, yaxis_title="Daily Volatility")
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown(f"""...<explanation>...""")
+
+    # Static vs dynamic threshold comparison
+    last_year = dfc[dfc['Date'] >= (dfc['Date'].max() - pd.DateOffset(years=1))]
+    thresh_fig = go.Figure()
+    thresh_fig.add_trace(go.Scatter(x=last_year['Date'], y=last_year['DailyVol'], mode='lines', name='Daily Volatility'))
+    thresh_fig.add_trace(go.Scatter(x=last_year['Date'], y=last_year['DynamicThreshold'], mode='lines', name='Dynamic Threshold (95%ile)', line=dict(color='orange', dash='dash')))
+    thresh_fig.add_hline(y=manual_threshold, line_color='red', line_dash='dot', annotation_text="Manual Threshold", annotation_position="bottom right")
+    thresh_fig.update_layout(title="Static vs Dynamic Threshold (Recent Year)", yaxis_title="Volatility", xaxis_title=None)
+    st.plotly_chart(thresh_fig, use_container_width=True)
+
+# --- Shock Simulation & Recalibration Tab ---
+with tab3:
+    st.header("Simulate a Volatility Shock")
+    st.write("Use the controls below to simulate a sudden volatility shock and see how thresholds adjust:")
+
+    snap_date = st.date_input("Baseline Date (Pre-Shock)", value=pd.to_datetime(dfc['Date'].iloc[-100]), min_value=dfc["Date"].min(), max_value=dfc["Date"].max())
+    shock_start = st.date_input("Shock Start Date", value=pd.to_datetime(dfc['Date'].iloc[-90]))
+    shock_end = st.date_input("Shock End Date", value=pd.to_datetime(dfc['Date'].iloc[-30]))
+    shock_mag = st.slider("Shock Magnitude (multiplicative factor on volatility)", min_value=1.0, max_value=5.0, value=2.0, step=0.1)
+
+    sim_df = dfc.copy()
+    mask = (sim_df['Date'] >= pd.to_datetime(shock_start)) & (sim_df['Date'] <= pd.to_datetime(shock_end))
+    sim_df['Vol_Shocked'] = sim_df['DailyVol'].copy()
+    sim_df.loc[mask, 'Vol_Shocked'] = sim_df.loc[mask, 'DailyVol'] * shock_mag
+
+    sim_df['DynThreshold_Shocked'] = rolling_quantile(sim_df['Vol_Shocked'], window, quantile_level)
+    evt_threshold_shocked = garch_evt(sim_df['LogReturn'], tail_pct=0.990)
+
+    baseline_dyn_thresh = sim_df[sim_df['Date'] <= snap_date]['DynThreshold_Shocked'].iloc[-1]
+    postshock_dyn_thresh = sim_df['DynThreshold_Shocked'].iloc[-1]
+    manual_threshold_baseline = sim_df[sim_df['Date'] <= snap_date]['DailyVol'].mean()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Manual Threshold (pre-shock)", f"{manual_threshold_baseline:.4f}")
+    col2.metric("Dynamic Threshold (pre-shock)", f"{baseline_dyn_thresh:.4f}")
+    col3.metric("Dynamic Threshold (post-shock)", f"{postshock_dyn_thresh:.4f}", delta=f"{(postshock_dyn_thresh-baseline_dyn_thresh):.4f}")
+
+    st.markdown(f"""...<shock markdown explanation>...""")
+
+    shock_fig = go.Figure()
+    shock_fig.add_trace(go.Scatter(x=sim_df['Date'], y=sim_df['DailyVol'], name="Original Volatility"))
+    shock_fig.add_trace(go.Scatter(x=sim_df['Date'], y=sim_df['Vol_Shocked'], name=f"Shocked Vol (x{shock_mag})", line=dict(color='royalblue')))
+    shock_fig.add_hline(y=baseline_dyn_thresh, line_dash="dot", line_color="orange", annotation_text="Pre-Shock Dyn Threshold", annotation_position="bottom right")
+    shock_fig.add_hline(y=postshock_dyn_thresh, line_dash="dash", line_color="green", annotation_text="Post-Shock Dyn Threshold", annotation_position="top right")
+    shock_fig.add_hline(y=manual_threshold_baseline, line_dash="dash", line_color="red", annotation_text="Manual Threshold", annotation_position="bottom left")
+    shock_fig.add_vrect(x0=shock_start, x1=shock_end, fillcolor="red", opacity=0.1, annotation_text="Shock Period", line_width=0)
+    shock_fig.update_layout(title=f"{selected_ccy} Volatility Shock Simulation", yaxis_title="Volatility", xaxis_title=None)
+    st.plotly_chart(shock_fig, use_container_width=True)
