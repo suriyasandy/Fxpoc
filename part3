@@ -1,0 +1,71 @@
+# --- Overview Tab ---
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs. Hybrid Approach")
+    st.markdown("""
+    ### Why Move Beyond Manual Thresholds?
+
+    **Manual Approach:**  
+    - Static thresholds per group (e.g., Group 1: 0.10, Group 2: 0.40, Group 3: 0.70, etc.)  
+    - Based on annualized volatility, then converted to daily average  
+    - Same threshold applied for months, not responsive to market shifts
+
+    **Hybrid Dynamic Approach:**  
+    - Rolling quantile thresholds adjust to volatility context  
+    - Regime detection (HMM) distinguishes low/medium/high volatility periods  
+    - EVT adds extreme event protection  
+    - All thresholds recalibrated monthly with current data  
+    - Helps capture market shocks, regime transitions, and persistent noise
+
+    **Business Value:**  
+    - Reduces false alerts in calm periods  
+    - Flags events early in stress periods  
+    - Explains changes using data-driven and transparent logic  
+    """)
+
+# --- Volatility Regimes Tab ---
+with tab2:
+    st.header(f"Volatility Regimes for {selected_ccy}")
+    fig = px.scatter(dfc, x='Date', y='DailyVol', color='RegimeName',
+                     title=f"{selected_ccy}: Daily Volatility by Regime",
+                     labels={"DailyVol": "Daily Volatility", "RegimeName": "Regime"})
+    fig.update_traces(marker=dict(size=6))
+    fig.update_layout(legend_title_text="Regime", xaxis_title=None, yaxis_title="Volatility")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Add comparison plot
+    comparison = go.Figure()
+    comparison.add_trace(go.Scatter(x=dfc['Date'], y=dfc['DailyVol'], name='Daily Volatility'))
+    comparison.add_trace(go.Scatter(x=dfc['Date'], y=dfc['DynamicThreshold'], name='Dynamic Threshold', line=dict(color='orange')))
+    comparison.add_hline(y=manual_threshold, line_color='red', line_dash='dot', annotation_text="Manual Threshold")
+    comparison.update_layout(title="Static vs Dynamic Threshold Comparison", yaxis_title="Volatility")
+    st.plotly_chart(comparison, use_container_width=True)
+
+# --- Shock Simulation Tab ---
+with tab3:
+    st.header("Simulate Volatility Shock")
+
+    snap_date = st.date_input("Baseline Snapshot Date", value=dfc['Date'].iloc[-90])
+    shock_start = st.date_input("Shock Start Date", value=dfc['Date'].iloc[-60])
+    shock_end   = st.date_input("Shock End Date", value=dfc['Date'].iloc[-30])
+    shock_mag   = st.slider("Shock Magnitude (x times)", 1.0, 5.0, 2.0, 0.1)
+
+    sim_df = dfc.copy()
+    mask = (sim_df['Date'] >= shock_start) & (sim_df['Date'] <= shock_end)
+    sim_df['Vol_Shocked'] = sim_df['DailyVol']
+    sim_df.loc[mask, 'Vol_Shocked'] *= shock_mag
+    sim_df['DynThreshold_Shocked'] = rolling_quantile(sim_df['Vol_Shocked'], window, quantile_level)
+
+    pre_shock_thresh = sim_df[sim_df['Date'] <= snap_date]['DynThreshold_Shocked'].iloc[-1]
+    post_shock_thresh = sim_df['DynThreshold_Shocked'].iloc[-1]
+
+    st.markdown(f"Manual threshold = **{manual_threshold:.4f}**  \n"
+                f"Dynamic pre-shock threshold = **{pre_shock_thresh:.4f}**  \n"
+                f"Dynamic post-shock threshold = **{post_shock_thresh:.4f}**")
+
+    shock_fig = go.Figure()
+    shock_fig.add_trace(go.Scatter(x=sim_df['Date'], y=sim_df['Vol_Shocked'], name="Shocked Volatility"))
+    shock_fig.add_trace(go.Scatter(x=sim_df['Date'], y=sim_df['DynThreshold_Shocked'], name="Dynamic Threshold", line=dict(color='green')))
+    shock_fig.add_hline(y=manual_threshold, line_dash="dot", line_color="red", annotation_text="Manual Threshold")
+    shock_fig.add_vrect(x0=shock_start, x1=shock_end, fillcolor="red", opacity=0.2, line_width=0)
+    shock_fig.update_layout(title="Volatility Shock Simulation", yaxis_title="Volatility")
+    st.plotly_chart(shock_fig, use_container_width=True)
