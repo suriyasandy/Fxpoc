@@ -1,0 +1,64 @@
+# Add this line where you define tabs
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Volatility Regimes", "Shock Simulation", "Cross-Pair Thresholds"])
+
+# --- Cross-Pair Thresholds Tab ---
+with tab4:
+    st.header("Cross-Currency Pair Threshold Recommendation")
+
+    # Currency selection (must exist in your currency_groups DataFrame)
+    base_ccy = st.selectbox("Select Base Currency", currency_groups["Currency"].unique(), index=0)
+    quote_ccy = st.selectbox("Select Quote Currency", currency_groups["Currency"].unique(), index=1)
+
+    # Lookup manual groups
+    base_grp = currency_groups.set_index("Currency").loc[base_ccy, "Group"]
+    quote_grp = currency_groups.set_index("Currency").loc[quote_ccy, "Group"]
+
+    # Logic to decide cross threshold based on volatility tier
+    base_rank = group_order[base_grp]
+    quote_rank = group_order[quote_grp]
+
+    if base_rank == quote_rank:
+        selected_group = base_grp
+    else:
+        # pick the higher group's threshold
+        selected_group = max([base_grp, quote_grp], key=lambda x: group_order[x])
+
+    manual_thr = manual_thresholds[selected_group]
+    st.success(f"Recommended Manual Threshold (from group logic): **{manual_thr:.2f}** (based on {selected_group})")
+
+    # Generate synthetic volatility for the cross pair
+    pair_name = f"{base_ccy}{quote_ccy}_synthetic"
+    if pair_name not in vol_df.columns:
+        vol_df[pair_name] = vol_df[f"{base_ccy}"] + vol_df[f"{quote_ccy}"]  # simple additive approximation
+
+    # Shock simulation inputs
+    shock_start = st.date_input("Shock Start Date", value=vol_df["Date"].iloc[-60])
+    shock_end = st.date_input("Shock End Date", value=vol_df["Date"].iloc[-10])
+    shock_mag = st.slider("Shock Magnitude (x times)", 1.0, 5.0, step=0.1, value=2.0)
+
+    # Apply shock
+    sim_df = vol_df.copy()
+    sim_df["Vol_Orig"] = sim_df[pair_name]
+    mask = (pd.to_datetime(sim_df['Date']) >= pd.to_datetime(shock_start)) & (pd.to_datetime(sim_df['Date']) <= pd.to_datetime(shock_end))
+    sim_df["Vol_Shocked"] = sim_df["Vol_Orig"].copy()
+    sim_df.loc[mask, "Vol_Shocked"] *= shock_mag
+
+    # Dynamic threshold on shocked
+    sim_df["Dyn_Thresh"] = rolling_quantile(sim_df["Vol_Shocked"], window=60, q=0.95)
+
+    # Plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["Vol_Orig"], name="Original Volatility"))
+    fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["Vol_Shocked"], name="Shocked Volatility", line=dict(color='royalblue')))
+    fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["Dyn_Thresh"], name="Dynamic Threshold (95%)", line=dict(color='orange')))
+    fig.add_hline(y=manual_thr, line_color="red", line_dash="dot", annotation_text="Manual Threshold")
+
+    fig.update_layout(title=f"{base_ccy}{quote_ccy} Cross Pair Volatility with Shock",
+                      yaxis_title="Synthetic Volatility", xaxis_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown(f"""
+    **Interpretation:** For the synthetic cross-pair **{base_ccy}{quote_ccy}**, we used the manual group logic to assign a threshold of **{manual_thr}**.
+    A simulated volatility shock from **{shock_start} to {shock_end}** (x{shock_mag:.1f}) causes the dynamic threshold to adjust automatically.
+    This showcases the benefit of data-driven thresholds over fixed group rules which remain static.
+    """)
