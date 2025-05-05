@@ -1,0 +1,117 @@
+# ────────────────────────────────────────────────────────────────────────────────
+# 🚀 Shock Simulation & Re-calibration (Updated for per-leg shock mags)
+# ────────────────────────────────────────────────────────────────────────────────
+with tab4:
+    st.header("🚀 Shock Simulation & Re-calibration")
+
+    # 1) Choose snapshot & shock end dates
+    min_date = dfc.index[0].date()
+    max_date = dfc.index[-1].date()
+    snap_date = st.date_input(
+        "Snapshot Date (pre-shock)",
+        value=(max_date - datetime.timedelta(days=30)),
+        min_value=min_date,
+        max_value=max_date - datetime.timedelta(days=1)
+    )
+    shock_date = st.date_input(
+        "Shock End Date",
+        value=max_date,
+        min_value=snap_date + datetime.timedelta(days=1),
+        max_value=max_date
+    )
+    # convert to timestamps existing in dfc
+    snap_ts  = max(d for d in dfc.index if d.date() <= snap_date)
+    shock_ts = max(d for d in dfc.index if d.date() <= shock_date)
+
+    # 2) Select which legs to shock
+    shock_leg = st.multiselect(
+        "Which leg(s) to shock?",
+        ['Base Leg','Quote Leg'],
+        default=['Quote Leg']
+    )
+
+    # 3) Per-leg shock magnitude sliders
+    shock_mag_base  = 1.0
+    shock_mag_quote = 1.0
+    if 'Base Leg' in shock_leg:
+        shock_mag_base = st.slider(
+            "Base Leg Shock × real vol",
+            1.0, 5.0, 2.0, 0.1
+        )
+    if 'Quote Leg' in shock_leg:
+        shock_mag_quote = st.slider(
+            "Quote Leg Shock × real vol",
+            1.0, 5.0, 2.0, 0.1
+        )
+
+    # 4) Build the “shocked” volatility series
+    b2 = b_ser.copy()
+    q2 = q_ser.copy()
+    mask = (b2.index > snap_ts) & (b2.index <= shock_ts)
+    if 'Base Leg' in shock_leg:
+        b2.loc[mask] *= shock_mag_base
+    if 'Quote Leg' in shock_leg:
+        q2.loc[mask] *= shock_mag_quote
+    vol2 = np.sqrt(b2.loc[idx]**2 + q2.loc[idx]**2)
+
+    # 5) Re-calibrate dynamic thresholds on the shocked series
+    dfd = dfc.copy()
+    dfd['Vol'] = vol2
+    dfd['Thr_Alert_shock']    = np.nan
+    dfd['Thr_Critical_shock'] = np.nan
+    for r, grp in dfd.groupby('Regime'):
+        w, q = calib[r]['window'], calib[r]['quantile']
+        dfd.loc[grp.index, 'Thr_Alert_shock'] = rolling_quantile(grp['Vol'], w, q)
+        dfd.loc[grp.index, 'Thr_Critical_shock'] = evt_vol_threshold(
+            grp['Vol'], 0.90, calib[r]['tail']
+        )
+
+    # 6) Show key metrics at snapshot vs post-shock
+    alert_snap = dfc.loc[snap_ts, 'Thr_Alert']
+    evt_snap   = dfc.loc[snap_ts, 'Thr_Critical']
+    alert_sh   = dfd.loc[shock_ts, 'Thr_Alert_shock']
+    evt_sh     = dfd.loc[shock_ts, 'Thr_Critical_shock']
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Manual Thr (static)",    f"{man_thr:.4f}")
+    col2.metric("Alert Thr @ snapshot",   f"{alert_snap:.4f}")
+    col3.metric("EVT Thr @ snapshot",     f"{evt_snap:.4f}")
+    col4.metric("Alert Thr @ post-shock", f"{alert_sh:.4f}")
+    col5.metric("EVT Thr @ post-shock",   f"{evt_sh:.4f}")
+
+    # 7) Visualize original vs shocked vol & thresholds
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(
+        x=dfc.index, y=dfc['Vol'], name="Orig Vol", line=dict(color='lightgrey')
+    ))
+    fig3.add_trace(go.Scatter(
+        x=dfd.index, y=dfd['Vol'], name="Shocked Vol", line=dict(color='blue')
+    ))
+    # shade the shock window
+    fig3.add_vrect(
+        x0=snap_ts, x1=shock_ts,
+        fillcolor="red", opacity=0.1, line_width=0
+    )
+    # overlay thresholds
+    fig3.add_hline(y=man_thr, line_dash='longdash', line_color='black',
+                   annotation_text="Manual", annotation_position="bottom right")
+    fig3.add_hline(y=alert_snap, line_dash='dash', line_color='orange',
+                   annotation_text="Alert @ snap", annotation_position="bottom right")
+    fig3.add_hline(y=alert_sh, line_dash='dash', line_color='orange',
+                   annotation_text="Alert @ shock", annotation_position="top right")
+    fig3.add_hline(y=evt_snap, line_dash='dot', line_color='red',
+                   annotation_text="EVT @ snap", annotation_position="bottom right")
+    fig3.add_hline(y=evt_sh, line_dash='dot', line_color='red',
+                   annotation_text="EVT @ shock", annotation_position="top right")
+    fig3.update_layout(
+        xaxis_title="Date", yaxis_title="Daily Volatility", height=500
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # 8) Business commentary
+    st.markdown(f"""
+    **Shock window** from **{snap_date:%Y-%m-%d}** to **{shock_date:%Y-%m-%d}**.  
+    - Manual threshold (black) is static & never moves.  
+    - Dynamic thresholds adapt both at snapshot (orange/red dashed) and again post-shock.  
+    - Shaded region highlights the synthetic stress period—proving our method *re-calibrates* where manual cannot.
+    """)
