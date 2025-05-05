@@ -1,0 +1,46 @@
+# --- Tab 2: Volatility Regimes ---
+with tab2:
+    st.header(f"Volatility Regimes for {selected_ccy}")
+    
+    # Regime scatter plot
+    fig = px.scatter(dfc, x='Date', y='DailyVol', color='RegimeName',
+                     title=f"{selected_ccy} Daily Volatility by Regime",
+                     labels={"DailyVol": "Daily Volatility", "RegimeName": "Regime"})
+    fig.update_traces(marker=dict(size=5))
+    fig.update_layout(legend_title_text="Regime",
+                      xaxis_title=None, yaxis_title="Volatility")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Explanation text
+    st.markdown(f"""
+    *Interpretation:* This chart shows volatility regimes for **{selected_ccy}**,  
+    detected using HMM (Hidden Markov Model).  
+    - Blue = Low Volatility  
+    - Green = Medium Volatility  
+    - Red = High Volatility  
+      
+    Regime detection provides **context** for dynamic thresholding.
+    """)
+
+    # --- Compare Manual vs Dynamic Thresholds ---
+    recent = dfc[dfc["Date"] >= dfc["Date"].max() - pd.DateOffset(days=365)]
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=recent["Date"], y=recent["DailyVol"], 
+                              name="Daily Volatility", line=dict(color='blue')))
+    fig2.add_trace(go.Scatter(x=recent["Date"], y=recent["DynamicThreshold"], 
+                              name="Dynamic Threshold", line=dict(color='orange', dash='dash')))
+    fig2.add_hline(y=manual_threshold, line_dash="dot", line_color="red",
+                   annotation_text="Manual Threshold", annotation_position="bottom right")
+
+    fig2.update_layout(title=f"{selected_ccy} - Static vs Dynamic Thresholds (1 Year)",
+                       yaxis_title="Volatility", xaxis_title="Date")
+    st.plotly_chart(fig2, use_container_width=True)
+
+    st.markdown(f"""
+    - **Red Line**: Manual threshold based on volatility group  
+    - **Orange Line**: Adaptive threshold (rolling 95th percentile)  
+    - **Blue Line**: Observed daily volatility  
+      
+    Notice how the dynamic threshold adjusts based on market conditions,
+    while the manual threshold stays flat.
+    """)
