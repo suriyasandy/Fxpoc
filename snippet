@@ -1,0 +1,24 @@
+# -- Convert all date inputs to pandas datetime first
+snap_date = pd.to_datetime(st.date_input("Snapshot Date", value=pd.to_datetime("2024-10-14")))
+shock_start = pd.to_datetime(st.date_input("Shock Start Date", value=pd.to_datetime("2024-10-15")))
+shock_end = pd.to_datetime(st.date_input("Shock End Date", value=datetime.date.today()))
+
+# -- Apply shock magnitude safely to selected date range
+mask = (dfc["Date"] >= shock_start) & (dfc["Date"] <= shock_end)
+dfc["ShockedVol"] = dfc["DailyVol"]
+dfc.loc[mask, "ShockedVol"] = dfc.loc[mask, "DailyVol"] * shock_mag
+
+# -- Calculate thresholds
+rolling_alert = rolling_quantile(dfc["ShockedVol"], window=90, q=0.95)
+evt_threshold = garch_evt(dfc["LogReturn"], tail_pct=0.990)
+latest_alert = rolling_alert.iloc[-1]
+manual_thr = dfc[dfc["Date"] <= snap_date]["DailyVol"].mean()
+
+# -- Visual comparison
+fig_shock = go.Figure()
+fig_shock.add_trace(go.Scatter(x=dfc["Date"], y=dfc["DailyVol"], name="Original Vol"))
+fig_shock.add_trace(go.Scatter(x=dfc["Date"], y=dfc["ShockedVol"], name="Shocked Vol", line=dict(color='blue')))
+fig_shock.add_hline(y=latest_alert, line_dash="dash", line_color="red")
+fig_shock.add_vrect(x0=shock_start, x1=shock_end, fillcolor="red", opacity=0.2, line_width=0)
+fig_shock.update_layout(title="Volatility with Shock Region", yaxis_title="Daily Volatility")
+st.plotly_chart(fig_shock, use_container_width=True)
