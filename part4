@@ -1,0 +1,28 @@
+    # Summary interpretation for business users
+    st.markdown(f"""
+    ### Business Interpretation
+
+    - During the red-shaded **shock period**, volatility is artificially increased to simulate a market event.
+    - Our dynamic threshold (green line) **automatically adapts** to the new reality.
+    - Meanwhile, the manual threshold (red dotted line) stays flat — it doesn't respond, risking under-alerting or over-alerting.
+
+    **Key Learning:**  
+    This exercise shows how dynamic models *learn from the market* and revise alert thresholds — providing a balance of **precision and proactiveness**, which is often lacking in static thresholds.
+
+    """)
+
+    # Optional: Export results
+    with st.expander("Download Simulation Results"):
+        export_df = sim_df[['Date', 'Vol_Shocked', 'DynThreshold_Shocked']]
+        export_df.columns = ['Date', 'Volatility_Shocked', 'Dynamic_Threshold']
+        st.download_button(
+            label="Download CSV",
+            data=export_df.to_csv(index=False),
+            file_name=f"{selected_ccy}_shock_simulation.csv",
+            mime='text/csv'
+        )
+
+# End of App
+st.markdown("---")
+st.markdown("**Developed for FX Volatility Risk Monitoring — Hybrid Thresholding PoC**")
+st.caption("Model: HMM (Regimes) + Rolling Quantile + EVT | Manual threshold logic: daily avg vol grouping")
