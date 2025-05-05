@@ -1,0 +1,53 @@
+# --- Tab 3: Shock Simulation for Single Currency ---
+with tab3:
+    st.header("Simulate a Volatility Shock")
+    st.write("Apply a temporary volatility shock and observe how thresholds recalibrate:")
+
+    # Shock control inputs
+    snap_date = st.date_input("Baseline Snapshot Date", value=dfc['Date'].iloc[-100].date(),
+                              min_value=dfc['Date'].min().date(), max_value=dfc['Date'].max().date())
+    shock_start = st.date_input("Shock Start Date", value=dfc['Date'].iloc[-60].date())
+    shock_end = st.date_input("Shock End Date", value=dfc['Date'].iloc[-20].date())
+    shock_mag = st.slider("Shock Magnitude (x times)", 1.0, 5.0, 2.0, step=0.1)
+
+    # Simulate shock in volatility
+    sim_df = dfc.copy()
+    sim_df['Date'] = pd.to_datetime(sim_df['Date'])  # ensure datetime type
+    mask = (sim_df["Date"] >= pd.to_datetime(shock_start)) & (sim_df["Date"] <= pd.to_datetime(shock_end))
+    sim_df["Vol_Shocked"] = sim_df["DailyVol"]
+    sim_df.loc[mask, "Vol_Shocked"] = sim_df.loc[mask, "DailyVol"] * shock_mag
+
+    # Recalculate rolling dynamic thresholds
+    sim_df["DynThreshold_Shocked"] = rolling_quantile(sim_df["Vol_Shocked"], window, quantile_level)
+
+    # Extract thresholds at key dates
+    pre_shock_thresh = sim_df[sim_df["Date"] <= pd.to_datetime(snap_date)]["DynThreshold_Shocked"].iloc[-1]
+    post_shock_thresh = sim_df["DynThreshold_Shocked"].iloc[-1]
+    manual_pre_shock = sim_df[sim_df["Date"] <= pd.to_datetime(snap_date)]["DailyVol"].mean()
+
+    # Display metrics
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Manual Threshold (Pre-Shock)", f"{manual_pre_shock:.2f}")
+    col2.metric("Dynamic Threshold (Pre-Shock)", f"{pre_shock_thresh:.2f}")
+    col3.metric("Dynamic Threshold (Post-Shock)", f"{post_shock_thresh:.2f}",
+                delta=f"{post_shock_thresh - pre_shock_thresh:.2f}")
+
+    # Plot shock simulation
+    shock_fig = go.Figure()
+    shock_fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["DailyVol"], name="Original Vol"))
+    shock_fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["Vol_Shocked"], name="Shocked Vol", line=dict(color="blue")))
+    shock_fig.add_trace(go.Scatter(x=sim_df["Date"], y=sim_df["DynThreshold_Shocked"], 
+                                   name="Dynamic Threshold (Shocked)", line=dict(color="green", dash="dash")))
+    shock_fig.add_hline(y=manual_pre_shock, line_dash="dot", line_color="red",
+                        annotation_text="Manual Threshold", annotation_position="bottom left")
+    shock_fig.add_vrect(x0=shock_start, x1=shock_end, fillcolor="red", opacity=0.2, line_width=0)
+
+    shock_fig.update_layout(title=f"{selected_ccy} Shock Simulation",
+                            xaxis_title="Date", yaxis_title="Volatility")
+    st.plotly_chart(shock_fig, use_container_width=True)
+
+    st.markdown(f"""
+    The red region marks the simulated shock.  
+    The **green line** shows how the dynamic threshold automatically adapts to rising volatility.  
+    The **red dotted line** (manual threshold) stays constant, potentially misrepresenting risk.
+    """)
