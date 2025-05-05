@@ -1,0 +1,31 @@
+-with tab4:
++with tab4:
+     st.header("🚀 Shock Simulation & Re-calibration")
+
+     # snapshot & shock dates …
+     snap_date = st.date_input("Snapshot Date (pre-shock)", …)
+     shock_date = st.date_input("Shock End Date", …)
+
+-    # shock parameters
+-    shock_leg    = st.multiselect("Which leg(s) to shock?", 
+-                                  ['Base Leg','Quote Leg'], default=['Quote Leg'])
+-    shock_factor = st.slider("Shock Magnitude (× real vol)", 1.0, 5.0, 2.0)
++    # shock parameters
++    shock_leg = st.multiselect("Which leg(s) to shock?", 
++                               ['Base Leg','Quote Leg'], default=['Quote Leg'])
++
++    # allow separate magnitudes if both selected
++    shock_mag_base  = 1.0
++    shock_mag_quote = 1.0
++    if 'Base Leg' in shock_leg:
++        shock_mag_base = st.slider("Base Leg Shock × real vol", 1.0, 5.0, 2.0)
++    if 'Quote Leg' in shock_leg:
++        shock_mag_quote = st.slider("Quote Leg Shock × real vol", 1.0, 5.0, 2.0)
+
+     # build shocked vol series
+     b2 = b_ser.copy(); q2 = q_ser.copy()
+     mask = (b2.index > snap_ts) & (b2.index <= shock_ts)
+-    if 'Base Leg'  in shock_leg: b2.loc[mask] *= shock_factor
+-    if 'Quote Leg' in shock_leg: q2.loc[mask] *= shock_factor
++    if 'Base Leg'  in shock_leg: b2.loc[mask] *= shock_mag_base
++    if 'Quote Leg' in shock_leg: q2.loc[mask] *= shock_mag_quote
