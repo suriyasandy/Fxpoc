@@ -1,0 +1,25 @@
+# --- Tab 3: Shock Simulation ---
+with tab3:
+    st.header("Simulate a Volatility Shock")
+
+    snap_date = st.date_input("Baseline Snapshot Date", value=pd.to_datetime("2024-06-11"))
+    shock_start = st.date_input("Shock Start Date", value=pd.to_datetime("2024-07-23"))
+    shock_end = st.date_input("Shock End Date", value=pd.to_datetime("2024-09-03"))
+    shock_mag = st.slider("Shock Magnitude (x times)", min_value=1.0, max_value=5.0, value=2.0, step=0.1)
+
+    # Ensure all dates are datetime64[ns]
+    snap_date = pd.to_datetime(snap_date)
+    shock_start = pd.to_datetime(shock_start)
+    shock_end = pd.to_datetime(shock_end)
+
+    sim_df = dfc.copy()
+    mask = (sim_df['Date'] >= shock_start) & (sim_df['Date'] <= shock_end)
+    sim_df['Vol_Shocked'] = sim_df['DailyVol']
+    sim_df.loc[mask, 'Vol_Shocked'] *= shock_mag
+
+    sim_df['DynThreshold_Shocked'] = rolling_quantile(sim_df['Vol_Shocked'], window, quantile_level)
+    pre_shock_thresh = sim_df[sim_df['Date'] <= snap_date]['DynThreshold_Shocked'].iloc[-1]
+    post_shock_thresh = sim_df['DynThreshold_Shocked'].iloc[-1]
+
+    st.metric("Dynamic Threshold (Pre-Shock)", f"{pre_shock_thresh:.4f}")
+    st.metric("Dynamic Threshold (Post-Shock)", f"{post_shock_thresh:.4f}", delta=f"{(post_shock_thresh - pre_shock_thresh):.4f}")
