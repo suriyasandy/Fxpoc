@@ -1,0 +1,31 @@
+# ---------------- LOAD DATA ----------------
+st.sidebar.title("Upload FX Data")
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+if uploaded_file:
+    df = pd.read_csv(uploaded_file, parse_dates=['Date'])
+    df.sort_values('Date', inplace=True)
+    df['DailyVol'] = df['OHLCVolatility'] / SQRT252
+    df['LogReturn'] = np.log(df['Close'] / df['Close'].shift(1))
+    df.dropna(inplace=True)
+
+    currencies = df['Currency'].unique()
+    selected_ccy = st.sidebar.selectbox("Select Currency", currencies)
+
+    window = st.sidebar.slider("Rolling Window (Days)", 20, 120, 60, step=10)
+    quantile_level = st.sidebar.slider("Quantile Threshold", 0.80, 0.99, 0.95, step=0.01)
+
+    dfc = df[df['Currency'] == selected_ccy].copy()
+    dfc['DynamicThreshold'] = rolling_quantile(dfc['DailyVol'], window, quantile_level)
+    dfc.dropna(inplace=True)
+
+    # --- MANUAL THRESHOLD CALC ---
+    manual_map, manual_avg_df = compute_manual_threshold(df)
+    manual_threshold = manual_map[selected_ccy]
+
+    # --- REGIME DETECTION ---
+    dfc['Regime'] = detect_regimes(dfc['DailyVol'], n_states=3)
+    dfc['RegimeName'] = dfc['Regime'].map({0: "Low", 1: "Medium", 2: "High"})
+
+    # --- CREATE TABS ---
+    tab1, tab2, tab3 = st.tabs(["Overview", "Volatility Regimes", "Shock Simulation"])
