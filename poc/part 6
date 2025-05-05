@@ -1,0 +1,25 @@
+    fig.update_layout(
+        title=f"{base_ccy}/{quote_ccy} Volatility with Shock Simulation",
+        yaxis_title="Volatility",
+        xaxis_title="Date",
+        height=500
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Threshold summary
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Manual Threshold (Cross)", f"{manual_threshold:.4f}")
+    col2.metric("Dynamic Pre-Shock", f"{pre_shock_dyn:.4f}")
+    col3.metric("Dynamic Post-Shock", f"{post_shock_dyn:.4f}",
+                delta=f"{post_shock_dyn - pre_shock_dyn:.4f}")
+
+    st.markdown(f"""
+    **Takeaway:** The red shaded area denotes a period of volatility shock, applied to one or both legs.
+    - The **manual threshold** stays static and may underreact to regime shifts.
+    - The **dynamic threshold** adapts based on observed volatility trends in both INR and JPY.
+    - This is particularly important in GFX markets where cross currency pairs like **{base_ccy}/{quote_ccy}**
+      are indirectly derived from underlying USD pairs, and hence must reflect both legs' behaviors.
+
+    Our simulation demonstrates that applying a dynamic, regime-aware calibration provides more realistic and 
+    timely thresholds for market stress scenarios — **a key improvement over static group-based methods**.
+    """)
