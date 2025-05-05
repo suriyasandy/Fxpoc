@@ -1,0 +1,62 @@
+# --- Load Data ---
+@st.cache_data
+def load_data():
+    df = pd.read_csv("fx_volatility_data.csv", parse_dates=["Date"])
+    df["DailyVol"] = df["VolatilityOHLC"]
+    df["LogReturn"] = np.log(df["Close"] / df["Close"].shift(1))
+    df["Group"] = df["DailyVol"].apply(assign_group)
+    return df
+
+df_all = load_data()
+
+# --- Sidebar for Currency Selection ---
+currencies = df_all["Currency"].unique().tolist()
+selected_ccy = st.sidebar.selectbox("Select Currency (vs USD)", currencies)
+dfc = df_all[df_all["Currency"] == selected_ccy].copy()
+
+# --- Add HMM Regimes and Dynamic Threshold ---
+dfc["Regime"] = detect_regimes(dfc["DailyVol"])
+regime_map = {0: "Low Vol", 1: "Medium Vol", 2: "High Vol"}
+dfc["RegimeName"] = dfc["Regime"].map(regime_map)
+dfc["DynamicThreshold"] = rolling_quantile(dfc["DailyVol"], ROLL_WINDOW, 0.95)
+
+# --- Manual Threshold (from Group) ---
+manual_group = assign_group(dfc["DailyVol"].mean())
+manual_threshold = MANUAL_THRESHOLDS[manual_group]
+
+# --- Tabs ---
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Overview", 
+    "Volatility Regimes", 
+    "Shock Simulation", 
+    "Cross-Pair Thresholds"
+])
+
+# --- Tab 1: Overview ---
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs. Hybrid Approach")
+    st.markdown("""
+    ### Why Move Beyond Manual Thresholds?
+
+    **Manual Approach:** Static thresholds by group, e.g.,  
+    - Group 1: 0.10  
+    - Group 2: 0.40  
+    - Group 3: 0.70  
+    - Group 4: 1.30  
+
+    **Problems:**  
+    - Doesn’t respond to volatility changes  
+    - Over/under-alerting in wrong regimes  
+    - Same rule for calm and turbulent times  
+
+    **Our Dynamic Model:**  
+    - Uses volatility regime detection (HMM)  
+    - Computes rolling 95th percentile threshold  
+    - Recalibrates after shocks  
+    - Adds tail risk detection using EVT  
+
+    **Business Impact:**  
+    - More precise alerts  
+    - Less manual tuning  
+    - Adapts to market conditions  
+    """)
