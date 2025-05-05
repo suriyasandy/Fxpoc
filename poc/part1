@@ -1,0 +1,50 @@
+# --- Imports ---
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime
+from hmmlearn.hmm import GaussianHMM
+from scipy.stats import genpareto
+from sklearn.svm import OneClassSVM
+from sklearn.ensemble import IsolationForest
+
+# --- Constants ---
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+MANUAL_THRESHOLDS = {
+    "Group 1": 0.10,
+    "Group 2": 0.40,
+    "Group 3": 0.70,
+    "Group 4": 1.30
+}
+
+# --- Helper Functions ---
+def rolling_quantile(series, window, q):
+    return series.rolling(window=window, min_periods=1).quantile(q)
+
+def garch_evt(data, tail_pct=0.99):
+    threshold = data.dropna().quantile(tail_pct)
+    excess = data[data > threshold] - threshold
+    if len(excess) < 5:
+        return threshold
+    params = genpareto.fit(excess)
+    return threshold + genpareto.ppf(0.99, *params)
+
+def detect_regimes(vol_series, n_states=3):
+    model = GaussianHMM(n_components=n_states, covariance_type="diag", n_iter=1000)
+    reshaped = vol_series.values.reshape(-1, 1)
+    model.fit(reshaped)
+    hidden_states = model.predict(reshaped)
+    return hidden_states
+
+def assign_group(vol):
+    if vol < 0.07:
+        return "Group 1"
+    elif vol < 0.5:
+        return "Group 2"
+    elif vol < 0.6:
+        return "Group 3"
+    else:
+        return "Group 4"
