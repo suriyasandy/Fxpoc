@@ -1,0 +1,5 @@
+# Apply shock to volatility for the specified period
+sim_df = dfc.copy()
+mask = (sim_df['Date'] >= pd.to_datetime(shock_start)) & (sim_df['Date'] <= pd.to_datetime(shock_end))
+sim_df['Vol_Shocked'] = sim_df['DailyVol'].copy()
+sim_df.loc[mask, 'Vol_Shocked'] = sim_df.loc[mask, 'DailyVol'] * shock_mag
