@@ -1,0 +1,207 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Utility Functions
+# ────────────────────────────────────────────────────────────────────────────────
+
+def rolling_quantile(vol, window, q):
+    return vol.rolling(window).quantile(q)
+
+def garch_evt(returns, tail_pct):
+    am = arch_model(returns * 100, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+    std = res.resid / res.conditional_volatility
+    std = std[~np.isnan(std)]
+    u = np.quantile(std, 0.90)
+    exc = std[std > u] - u
+    c, loc, scale = genpareto.fit(exc, floc=0)
+    p_exc = (tail_pct - (1 - np.mean(std > u))) / np.mean(std > u)
+    var = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    return (u + var) / 100.0
+
+def detect_regimes(vol, n_states):
+    model = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200)
+    arr = vol.values.reshape(-1, 1)
+    model.fit(arr)
+    states = model.predict(arr)
+    means = {s: arr[states == s].mean() for s in np.unique(states)}
+    return states, max(means, key=means.get), means
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Streamlit App
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Thresholding App", layout="wide")
+
+# ─ Sidebar: Upload & Settings
+st.sidebar.header("Upload & Settings")
+f = st.sidebar.file_uploader(
+    "Upload CSV (Date,Open,High,Low,Close,OHLCVolatility,Currency)",
+    type="csv"
+)
+if not f:
+    st.sidebar.info("Awaiting FX data…")
+    st.stop()
+
+df = pd.read_csv(f, parse_dates=['Date']).sort_values('Date')
+df['DailyVol'] = df['OHLCVolatility'] / np.sqrt(252)
+
+# Currency selector
+currencies = sorted(df['Currency'].unique())
+selected_ccy = st.sidebar.selectbox("Select Currency", currencies)
+
+# ─ Data Prep for Selected Currency
+dfc = df[df['Currency'] == selected_ccy].copy().reset_index(drop=True)
+dfc['LogReturn'] = np.log(dfc['Close'] / dfc['Close'].shift(1))
+dfc = dfc.dropna().reset_index(drop=True)
+dfc['Date'] = pd.to_datetime(dfc['Date'])
+
+# Regime detection (HMM)
+states, high_regime, regime_means = detect_regimes(dfc['DailyVol'], n_states=3)
+dfc['Regime'] = states
+
+# ─ Tabs
+tab1, tab2, tab3 = st.tabs(["📋 Overview", "📊 Regimes & Thresholds", "🚀 Shock Simulation"])
+
+# ─ Overview Tab
+with tab1:
+    st.title("FX Volatility Thresholding: Manual vs Hybrid Dynamic")
+    st.markdown("""
+    **Why Manual Falls Short:**  
+    - **Fixed Bands** based on 1-year averages never adapt post-shock.  
+    - Leads to **missed high-volatility events** or **false alarms** in calm regimes.
+
+    **Hybrid Dynamic Solution:**  
+    1. **Regime-Aware**: HMM splits into Calm/Normal/Stress states.  
+    2. **Per-Regime Calibration**: Rolling 95th + EVT tail per state.  
+    3. **Instant Recalibration** post-shock so thresholds **track true risk**.
+
+    > **Illustration**: A manual threshold of 0.70 (Oct 14) vs. a dynamic threshold rising to ~1.08 after an Oct 15–Nov 30 shock.
+    """)
+
+# ─ Regimes & Thresholds Tab
+with tab2:
+    st.header(f"Volatility Regimes & Thresholds — {selected_ccy}")
+
+    # Scatter by Regime
+    fig = px.scatter(
+        dfc, x='Date', y='DailyVol', color='Regime',
+        title=f"{selected_ccy} Daily Volatility by Regime", height=400
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Static manual threshold (1-year avg)
+    manual_thr_static = dfc['DailyVol'].mean()
+
+    # Dynamic sample thresholds (last day of series)
+    window = 90
+    dyn_alert_last = rolling_quantile(dfc['DailyVol'], window, 0.95).iloc[-1]
+    dyn_evt_last   = garch_evt(dfc['LogReturn'], tail_pct=0.99)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Manual Thr (1yr avg)", f"{manual_thr_static:.4f}")
+    col2.metric("Dynamic Alert 95% (last)", f"{dyn_alert_last:.4f}")
+    col3.metric("Dynamic EVT (last)", f"{dyn_evt_last:.4f}")
+
+# ─ Shock Simulation Tab
+with tab3:
+    st.header("Shock Simulation & Threshold Recalibration")
+
+    # Snapshot date = last business day before any shock
+    snap_date = st.date_input(
+        "Snapshot Date (pre-shock)",
+        value=(dfc['Date'].max() - pd.Timedelta(days=1)).date(),
+        min_value=dfc['Date'].min().date(),
+        max_value=(dfc['Date'].max() - pd.Timedelta(days=1)).date()
+    )
+    # Immediately convert to Timestamp for comparison
+    snap_date = pd.to_datetime(snap_date)
+
+    # Shock window inputs
+    shock_start = st.date_input(
+        "Shock Start Date",
+        value=(snap_date + pd.Timedelta(days=1)).date(),
+        min_value=(snap_date + pd.Timedelta(days=1)).date(),
+        max_value=dfc['Date'].max().date()
+    )
+    shock_end = st.date_input(
+        "Shock End Date",
+        value=dfc['Date'].max().date(),
+        min_value=(shock_start).date(),
+        max_value=dfc['Date'].max().date()
+    )
+    # Convert both to Timestamps
+    shock_start = pd.to_datetime(shock_start)
+    shock_end   = pd.to_datetime(shock_end)
+
+    # Shock magnitude
+    shock_mag = st.slider(
+        "Shock Magnitude (× real vol)", 1.0, 5.0, 2.0, step=0.1
+    )
+
+    # Apply shock to the selected window
+    dfc['ShockedVol'] = dfc['DailyVol']
+    mask = (dfc['Date'] >= shock_start) & (dfc['Date'] <= shock_end)
+    dfc.loc[mask, 'ShockedVol'] *= shock_mag
+
+    # Recompute dynamic thresholds post-shock
+    post_alert = rolling_quantile(dfc['ShockedVol'], window, 0.95).iloc[-1]
+    post_evt   = garch_evt(
+        dfc.loc[dfc['Date'] <= shock_end, 'LogReturn'],
+        tail_pct=0.99
+    )
+
+    # Manual threshold frozen at snapshot
+    manual_thr = dfc.loc[dfc['Date'] <= snap_date, 'DailyVol'].mean()
+
+    # Show comparison table
+    st.subheader("Threshold Comparison")
+    comp_df = pd.DataFrame({
+        "Threshold": ["Manual (static)", "Dynamic Alert", "Dynamic EVT"],
+        "Value":     [manual_thr, post_alert, post_evt]
+    }).set_index("Threshold")
+    st.table(comp_df)
+
+    # Plot full series + shock
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(
+        x=dfc['Date'], y=dfc['DailyVol'], name='Original Vol', line=dict(color='grey')
+    ))
+    fig2.add_trace(go.Scatter(
+        x=dfc['Date'], y=dfc['ShockedVol'], name='Shocked Vol', line=dict(color='blue')
+    ))
+    # Horizontal lines
+    fig2.add_hline(
+        y=manual_thr, line_dash='dash', line_color='green',
+        annotation_text='Manual Thr', annotation_position='bottom right'
+    )
+    fig2.add_hline(
+        y=post_alert, line_dash='dot', line_color='red',
+        annotation_text='Dynamic Alert Thr'
+    )
+    fig2.add_hline(
+        y=post_evt, line_dash='longdash', line_color='purple',
+        annotation_text='Dynamic EVT Thr'
+    )
+    # Shock period shading
+    fig2.add_vrect(
+        x0=shock_start, x1=shock_end,
+        fillcolor='red', opacity=0.2, layer='below',
+        annotation_text='Shock Window', annotation_position='top left'
+    )
+    fig2.update_layout(
+        title="Volatility Trend & Shock Simulation",
+        yaxis_title="Daily Volatility",
+        height=450
+    )
+    st.plotly_chart(fig2, use_container_width=True)
