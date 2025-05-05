@@ -1,0 +1,111 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from arch import arch_model
+
+# --- Constants ---
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+MANUAL_BANDS = [(0.0, 0.07), (0.07, 0.5), (0.5, 0.6), (0.6, float("inf"))]
+MANUAL_THRESHOLDS = [0.10, 0.40, 0.70, 1.30]
+
+# --- Load Data ---
+@st.cache_data
+def load_data():
+    df = pd.read_csv("reuters_fx_data.csv")
+    df['LogReturn'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Volatility'] = df['LogReturn'].rolling(ROLL_WINDOW).std() * ANNUALIZE
+    df.dropna(inplace=True)
+    return df
+
+# --- Manual Threshold Assignment ---
+def assign_manual_group(vol):
+    for (low, high), threshold in zip(MANUAL_BANDS, MANUAL_THRESHOLDS):
+        if low <= vol < high:
+            return threshold
+    return MANUAL_THRESHOLDS[-1]
+
+# --- Statistical Threshold ---
+def calc_stat_threshold(vols):
+    return vols.quantile(PCT_THRESHOLD)
+
+# --- ML Models ---
+def ml_flags(df):
+    iso = IsolationForest(contamination=0.05)
+    svm = OneClassSVM(nu=0.05)
+    df['IF_Flag'] = iso.fit_predict(df[['Volatility']])
+    df['SVM_Flag'] = svm.fit_predict(df[['Volatility']])
+    return df
+
+# --- Cross-Pair Volatility ---
+def synthetic_threshold(df, base, quote):
+    base_vol = df[df['Currency'] == base]['Volatility'].mean()
+    quote_vol = df[df['Currency'] == quote]['Volatility'].mean()
+    return np.sqrt(base_vol**2 + quote_vol**2)
+
+# --- Streamlit App ---
+df = load_data()
+st.set_page_config(layout="wide")
+st.title("FX Thresholding Framework: Manual vs Statistical vs ML")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Per-Currency Thresholds", "Cross-Pair Logic", "Shock Simulator", "Flag Simulation"])
+
+with tab1:
+    st.header("Business Rationale")
+    st.markdown("""
+    **Why This App?**
+    - Manual thresholds are rigid and outdated.
+    - Dynamic thresholds adapt to recent volatility and identify real anomalies.
+    - Our hybrid model combines statistical rigor and business explainability.
+
+    **Approach Summary:**
+    - Group-based manual bands → [0.1, 0.4, 0.7, 1.3]
+    - Statistical model → 95th percentile of recent volatility
+    - ML models → One-Class SVM and Isolation Forest
+    """)
+
+with tab2:
+    st.header("Per-Currency Threshold Comparison")
+    summary = df.groupby('Currency').agg(
+        AvgVol=('Volatility', 'mean'),
+        StatThreshold=('Volatility', lambda x: calc_stat_threshold(x))
+    ).reset_index()
+    summary['ManualThreshold'] = summary['AvgVol'].apply(assign_manual_group)
+    st.dataframe(summary.style.format("{:.4f}"))
+
+with tab3:
+    st.header("Cross-Currency Synthetic Threshold")
+    ccys = df['Currency'].unique().tolist()
+    base = st.selectbox("Base Currency", ccys)
+    quote = st.selectbox("Quote Currency", ccys, index=1)
+    synth_val = synthetic_threshold(df, base, quote)
+    st.metric(f"{base}/{quote} Synthetic Threshold", f"{synth_val:.4f}")
+
+with tab4:
+    st.header("Shock Simulation")
+    shock = st.slider("Shock (%)", -50, 200, 0, step=10)
+    base2 = st.selectbox("Shock Base", ccys, key="base2")
+    quote2 = st.selectbox("Shock Quote", ccys, index=1, key="quote2")
+    base_val = synthetic_threshold(df, base2, quote2)
+    shocked = base_val * (1 + shock / 100)
+    fig = go.Figure(data=[go.Scatter(x=["Original", "Shocked"], y=[base_val, shocked], mode="lines+markers")])
+    fig.update_layout(title="Shock Impact", yaxis_title="Volatility", xaxis_title="Scenario")
+    st.plotly_chart(fig)
+    st.write(f"Baseline: {base_val:.4f} | Shocked: {shocked:.4f}")
+
+with tab5:
+    st.header("Flag Simulation")
+    df = ml_flags(df)
+    df['Stat_Flag'] = df['Volatility'] > calc_stat_threshold(df['Volatility'])
+    df['Manual_Flag'] = df['Volatility'].apply(lambda v: v > assign_manual_group(v))
+    counts = df[['Manual_Flag', 'Stat_Flag', 'IF_Flag', 'SVM_Flag']].apply(lambda x: (x == 1).sum())
+    st.metric("Manual Flags", counts['Manual_Flag'])
+    st.metric("Statistical Flags", counts['Stat_Flag'])
+    st.metric("IF Flags", (df['IF_Flag'] == -1).sum())
+    st.metric("SVM Flags", (df['SVM_Flag'] == -1).sum())
