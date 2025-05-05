@@ -1,0 +1,51 @@
+# ---------------- IMPORTS ----------------
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ---------------- SETTINGS ----------------
+st.set_page_config(page_title="FX Threshold Dashboard", layout="wide")
+
+# ---------------- UTILITY FUNCTIONS ----------------
+SQRT252 = np.sqrt(252)
+
+def rolling_quantile(series, window, quantile):
+    return series.rolling(window=window).quantile(quantile)
+
+def garch_evt(log_returns, tail_pct=0.990):
+    std_returns = (log_returns - np.mean(log_returns)) / np.std(log_returns)
+    threshold = np.quantile(std_returns, 0.90)
+    excess = std_returns[std_returns > threshold] - threshold
+    c, loc, scale = genpareto.fit(excess, floc=0)
+    p_exceed = (tail_pct - (1 - np.mean(std_returns > threshold))) / np.mean(std_returns > threshold)
+    var = genpareto.ppf(p_exceed, c, loc=0, scale=scale)
+    return (threshold + var) * np.std(log_returns) + np.mean(log_returns)
+
+def detect_regimes(vol_series, n_states=3):
+    model = GaussianHMM(n_components=n_states, covariance_type='diag', n_iter=200)
+    X = vol_series.values.reshape(-1, 1)
+    model.fit(X)
+    hidden_states = model.predict(X)
+    return hidden_states
+
+def compute_manual_threshold(df, currency_col="Currency", vol_col="OHLCVolatility"):
+    df['DailyVol'] = df[vol_col] / SQRT252
+    avg_daily_vol = df.groupby(currency_col)['DailyVol'].mean().reset_index()
+    manual_threshold_map = {}
+    for _, row in avg_daily_vol.iterrows():
+        vol = row['DailyVol']
+        if vol < 0.10:
+            thr = 0.10
+        elif vol < 0.40:
+            thr = 0.40
+        elif vol < 0.70:
+            thr = 0.70
+        else:
+            thr = 1.30
+        manual_threshold_map[row[currency_col]] = thr
+    return manual_threshold_map, avg_daily_vol
