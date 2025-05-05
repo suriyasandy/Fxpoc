@@ -1,0 +1,83 @@
+# --- Tab 4: Cross Currency Pair Shock Simulation ---
+with tab4:
+    st.header("Cross Currency Threshold Simulation")
+    st.markdown("""
+    This section evaluates cross-currency thresholds using both manual logic and our dynamic approach.
+    Cross pairs are constructed from available currencies (e.g., INR/JPY = INR/USD * USD/JPY).
+    """)
+
+    # Select base and quote currencies
+    all_ccy = sorted(df['Currency'].unique())
+    base = st.selectbox("Base Currency", all_ccy, index=0)
+    quote = st.selectbox("Quote Currency", all_ccy, index=1)
+
+    if base == quote:
+        st.warning("Base and Quote currencies must differ.")
+        st.stop()
+
+    cross_name = f"{base}/{quote}"
+    cross_df = cross_data[cross_data["Cross"] == cross_name].copy()
+
+    if cross_df.empty:
+        st.warning(f"No data available for {cross_name}.")
+        st.stop()
+
+    # Select regimes
+    n_states_cross = st.slider("HMM States for Cross", 2, 4, 2, key="cross_regime")
+    cross_df["Regime"], cross_high, _ = detect_regimes(cross_df["Volatility"], n_states_cross)
+    cross_df["RegimeName"] = cross_df["Regime"].map(lambda r: f"Regime {r}")
+
+    # Manual threshold logic
+    b1 = manual_group_map.get(base)
+    b2 = manual_group_map.get(quote)
+    group_order = ['Low', 'Medium', 'High', 'VeryHigh']
+    if group_order.index(b1) > group_order.index(b2):
+        manual_band_cross = b1
+    else:
+        manual_band_cross = b2
+    manual_thr_cross = band_threshold_map[manual_band_cross]
+
+    # Shock sliders per leg
+    st.subheader("Shock Simulation on Legs")
+    leg_shock_base = st.slider(f"{base} Shock Magnitude", 1.0, 5.0, 1.5, 0.1)
+    leg_shock_quote = st.slider(f"{quote} Shock Magnitude", 1.0, 5.0, 1.0, 0.1)
+
+    # Create synthetic shocked volatility
+    base_vol = vol_matrix[base].copy()
+    quote_vol = vol_matrix[quote].copy()
+    shocked_vol = np.sqrt((base_vol * leg_shock_base) ** 2 + (quote_vol * leg_shock_quote) ** 2)
+    shocked_df = cross_df.copy()
+    shocked_df["Vol_Shocked"] = shocked_vol.loc[shocked_df["Date"]].values
+
+    # Rolling threshold
+    shocked_df["Dyn_Thr"] = rolling_quantile(shocked_df["Vol_Shocked"], window, quantile_level)
+
+    # Final values for comparison
+    last_vol = shocked_df["Vol_Shocked"].iloc[-1]
+    last_dyn_thr = shocked_df["Dyn_Thr"].iloc[-1]
+
+    st.subheader(f"Threshold Comparison for {cross_name}")
+    st.metric("Manual Threshold", f"{manual_thr_cross:.4f}")
+    st.metric("Latest Volatility (Shocked)", f"{last_vol:.4f}")
+    st.metric("Dynamic Threshold", f"{last_dyn_thr:.4f}",
+              delta=f"{(last_dyn_thr - manual_thr_cross):.4f}")
+
+    # Plot
+    cross_fig = go.Figure()
+    cross_fig.add_trace(go.Scatter(x=shocked_df["Date"], y=shocked_df["Volatility"],
+                                   name="Original Volatility", line=dict(color="blue")))
+    cross_fig.add_trace(go.Scatter(x=shocked_df["Date"], y=shocked_df["Vol_Shocked"],
+                                   name="Shocked Volatility", line=dict(color="purple")))
+    cross_fig.add_trace(go.Scatter(x=shocked_df["Date"], y=shocked_df["Dyn_Thr"],
+                                   name="Dynamic Threshold", line=dict(color="green", dash="dash")))
+    cross_fig.add_hline(y=manual_thr_cross, line_color="red", line_dash="dot",
+                        annotation_text="Manual Threshold", annotation_position="top left")
+    cross_fig.update_layout(title=f"{cross_name} - Manual vs Dynamic Threshold under Shock",
+                            yaxis_title="Volatility", xaxis_title=None)
+    st.plotly_chart(cross_fig, use_container_width=True)
+
+    st.markdown(f"""
+    The dynamic threshold reflects updated behavior from volatility changes in both legs.  
+    Manual threshold remains static, chosen based on the higher group of {base} or {quote}.  
+    **Dynamic threshold adjusts immediately to reflect new risk level.**
+    """)
