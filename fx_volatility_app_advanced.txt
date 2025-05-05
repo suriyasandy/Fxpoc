@@ -1,0 +1,114 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from arch import arch_model
+
+# --- Constants ---
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+PCT_THRESHOLD = 0.95
+
+# --- Load Data ---
+@st.cache_data
+def load_data():
+    df = pd.read_csv("reuters_fx_data.csv")
+    df['LogReturn'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['Volatility'] = df['LogReturn'].rolling(ROLL_WINDOW).std() * ANNUALIZE
+    df.dropna(inplace=True)
+    return df
+
+# --- Manual Grouping ---
+def manual_grouping(df):
+    bins = [0, 0.07, 0.5, 0.6, float("inf")]
+    labels = ['Group 1', 'Group 2', 'Group 3', 'Group 4']
+    df['ManualGroup'] = pd.cut(df['Volatility'], bins=bins, labels=labels)
+    group_avg = df.groupby('ManualGroup')['Volatility'].mean()
+    thresholds = group_avg * 2.5
+    return df, thresholds
+
+# --- Statistical Dynamic Threshold ---
+def rolling_threshold(df):
+    return df['Volatility'].quantile(PCT_THRESHOLD)
+
+# --- One-Class SVM Thresholding ---
+def one_class_svm(df):
+    model = OneClassSVM(nu=0.05, kernel="rbf", gamma="scale")
+    df['OCSVM_Flag'] = model.fit_predict(df[['Volatility']])
+    return df
+
+# --- Isolation Forest Thresholding ---
+def isolation_forest(df):
+    iso = IsolationForest(contamination=0.05, random_state=42)
+    df['IF_Flag'] = iso.fit_predict(df[['Volatility']])
+    return df
+
+# --- GARCH Volatility Estimation ---
+def fit_garch(df):
+    model = arch_model(df['LogReturn'] * 100, vol='Garch', p=1, q=1)
+    res = model.fit(disp="off")
+    df['GARCHVol'] = res.conditional_volatility / 100
+    return df
+
+# --- Cross-Pair Volatility ---
+def cross_pair_vol(df, base, quote):
+    base_vol = df[df['Currency'] == base]['Volatility'].mean()
+    quote_vol = df[df['Currency'] == quote]['Volatility'].mean()
+    return np.sqrt(base_vol**2 + quote_vol**2)
+
+# --- Streamlit App ---
+st.title("FX Volatility Monitoring: Manual vs ML vs Statistical")
+
+df = load_data()
+
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Model Thresholds", "Cross-Pair", "Shock Simulation"])
+
+with tab1:
+    st.subheader("Manual Grouping")
+    df, manual_thresholds = manual_grouping(df)
+    st.dataframe(manual_thresholds.reset_index().rename(columns={'Volatility': 'Manual Threshold'}))
+    
+    st.subheader("Volatility Histogram")
+    st.plotly_chart(px.histogram(df, x='Volatility', nbins=50, title="Volatility Distribution"), use_container_width=True)
+
+with tab2:
+    st.subheader("Rolling 95th Percentile")
+    roll_thresh = rolling_threshold(df)
+    st.metric("Stat Threshold", f"{roll_thresh:.4f}")
+
+    st.subheader("One-Class SVM")
+    df = one_class_svm(df)
+    st.dataframe(df[['Volatility', 'OCSVM_Flag']].head())
+
+    st.subheader("Isolation Forest")
+    df = isolation_forest(df)
+    st.dataframe(df[['Volatility', 'IF_Flag']].head())
+
+    st.subheader("GARCH Volatility")
+    df = fit_garch(df)
+    st.line_chart(df[['Volatility', 'GARCHVol']])
+
+with tab3:
+    st.subheader("Synthetic Cross-Pair Threshold")
+    ccy_list = df['Currency'].unique()
+    base = st.selectbox("Base Currency", ccy_list)
+    quote = st.selectbox("Quote Currency", ccy_list, index=1)
+    synth_vol = cross_pair_vol(df, base, quote)
+    st.metric(f"{base}/{quote} Synthetic Volatility", f"{synth_vol:.4f}")
+
+with tab4:
+    st.subheader("Shock Simulation")
+    shock_pct = st.slider("Shock (%)", -50, 200, 0, 10)
+    base = st.selectbox("Shock Base", ccy_list, key="shock_base")
+    quote = st.selectbox("Shock Quote", ccy_list, index=1, key="shock_quote")
+    base_val = cross_pair_vol(df, base, quote)
+    shocked = base_val * (1 + shock_pct / 100)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=["Original", "Shocked"], y=[base_val, shocked], mode="lines+markers"))
+    fig.update_layout(title="Shock Impact", xaxis_title="Scenario", yaxis_title="Volatility")
+    st.plotly_chart(fig)
+    st.write(f"Original: {base_val:.4f} | Shocked: {shocked:.4f}")
