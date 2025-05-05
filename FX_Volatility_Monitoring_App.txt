@@ -1,0 +1,107 @@
+
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from arch import arch_model
+from sklearn.mixture import GaussianMixture
+import streamlit as st
+
+# Constants
+ROLL_WINDOW = 60  # Rolling window size for volatility calculation
+ANNUALIZE = np.sqrt(252)  # Annualization factor for volatility
+
+# Load data (replace this with actual data loading logic)
+@st.cache
+def load_data():
+    # For example, loading from a CSV (this should be adapted to your data source)
+    return pd.read_csv('fx_data.csv')
+
+# Preprocess data
+def preprocess_data(df):
+    df['log_ret'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['volatility'] = df['log_ret'].rolling(window=ROLL_WINDOW).std() * ANNUALIZE
+    return df.dropna()
+
+# Manual Thresholding Logic
+def manual_thresholding(df):
+    # Grouping based on fixed thresholds (as per the manual grouping logic)
+    groups = {
+        'Group 1': (0.00, 0.07),
+        'Group 2': (0.07, 0.5),
+        'Group 3': (0.5, 0.6),
+        'Group 4': (0.6, np.inf)
+    }
+    
+    df['group'] = pd.cut(df['volatility'], bins=[0, 0.07, 0.5, 0.6, np.inf], labels=['Group 1', 'Group 2', 'Group 3', 'Group 4'])
+    
+    return df
+
+# Dynamic Thresholding (Using Statistical Methods)
+def dynamic_thresholding(df):
+    # Using Gaussian Mixture Model to dynamically calculate thresholds
+    gmm = GaussianMixture(n_components=4)
+    df['group_dynamic'] = gmm.fit_predict(df[['volatility']])
+    
+    return df
+
+# Cross-Currency Pair Evaluation
+def calculate_cross_pair_thresholds(df, base_currency, quote_currency):
+    # Synthetic cross-currency pair calculation (e.g., INRJPY = INRUSD + USDJPY)
+    cross_pair_volatility = df[df['Currency'] == base_currency]['volatility'] + df[df['Currency'] == quote_currency]['volatility']
+    return cross_pair_volatility.mean()
+
+# Visualization (Manual vs. Dynamic)
+def plot_volatility_comparison(df):
+    # Plotting comparison of manual vs dynamic thresholds
+    fig = px.bar(df, x='Currency', y=['volatility', 'group_dynamic'], title="Volatility Comparison")
+    st.plotly_chart(fig)
+
+# Backtesting and Simulation
+def backtest_thresholds(df, manual_threshold, dynamic_threshold):
+    # Compare how both methods perform over time
+    manual_flags = df['volatility'] > manual_threshold
+    dynamic_flags = df['volatility'] > dynamic_threshold
+    
+    # Plot results and show performance metrics
+    st.write(f"Manual Threshold Hits: {manual_flags.sum()}")
+    st.write(f"Dynamic Threshold Hits: {dynamic_flags.sum()}")
+    
+    # Plot comparison
+    fig = px.histogram(df, x='volatility', color=manual_flags, title='Manual Threshold Performance')
+    st.plotly_chart(fig)
+
+# Main function to handle Streamlit app navigation
+def main():
+    st.sidebar.title("FX Volatility Monitoring App")
+    app_mode = st.sidebar.radio("Choose a Tab", ["Overview", "Volatility Comparison", "Cross-Currency Pair Evaluation", "Backtesting"])
+    
+    # Load and preprocess data
+    df = load_data()
+    df = preprocess_data(df)
+    
+    if app_mode == "Overview":
+        st.title("Overview of FX Volatility Thresholding")
+        st.write("This app compares manual vs dynamic statistical thresholds for FX volatility.")
+        st.slider('Percentile for Statistical Thresholding', 0, 100, 95)
+    
+    elif app_mode == "Volatility Comparison":
+        st.title("Volatility Grouping and Comparison")
+        df = manual_thresholding(df)
+        df = dynamic_thresholding(df)
+        plot_volatility_comparison(df)
+    
+    elif app_mode == "Cross-Currency Pair Evaluation":
+        st.title("Cross-Currency Pair Evaluation")
+        base_currency = st.selectbox("Base Currency", ['INR', 'USD', 'EUR', 'GBP'])
+        quote_currency = st.selectbox("Quote Currency", ['INR', 'USD', 'EUR', 'GBP'])
+        cross_pair_volatility = calculate_cross_pair_thresholds(df, base_currency, quote_currency)
+        st.write(f"Cross-currency pair {base_currency}-{quote_currency} volatility: {cross_pair_volatility}")
+    
+    elif app_mode == "Backtesting":
+        st.title("Backtesting Dynamic vs Manual Thresholds")
+        manual_threshold = st.number_input("Manual Threshold", min_value=0.0, max_value=2.0, value=0.4)
+        dynamic_threshold = st.number_input("Dynamic Threshold", min_value=0.0, max_value=2.0, value=0.6)
+        backtest_thresholds(df, manual_threshold, dynamic_threshold)
+
+if __name__ == "__main__":
+    main()
