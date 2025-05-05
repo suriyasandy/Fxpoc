@@ -1,0 +1,95 @@
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy.stats import zscore
+
+# --- Constants ---
+ROLL_WINDOW = 60
+ANNUALIZE = np.sqrt(252)
+THRESHOLD_PERCENTILE = 0.95
+
+# --- Load and preprocess data ---
+@st.cache_data
+def load_data():
+    df = pd.read_csv("reuters_fx_data.csv")
+    df['DailyVolatility'] = df['OHLCVolatility'] / ANNUALIZE
+    df['LogReturn'] = np.log(df['Close'] / df['Close'].shift(1))
+    df.dropna(inplace=True)
+    return df
+
+# --- Manual Threshold Grouping ---
+def manual_grouping(df):
+    bins = [0.0, 0.07, 0.5, 0.6, float("inf")]
+    labels = ['Group 1', 'Group 2', 'Group 3', 'Group 4']
+    df['ManualGroup'] = pd.cut(df['OHLCVolatility'], bins=bins, labels=labels)
+    group_thresholds = df.groupby('ManualGroup')['OHLCVolatility'].mean() * 2.5
+    return df, group_thresholds
+
+# --- Dynamic Threshold (Statistical) ---
+def dynamic_threshold(df):
+    df['RollingVol'] = df['LogReturn'].rolling(ROLL_WINDOW).std() * ANNUALIZE
+    rolling_threshold = df['RollingVol'].quantile(THRESHOLD_PERCENTILE)
+    return rolling_threshold
+
+# --- Synthetic Cross-Pair Threshold ---
+def cross_pair_threshold(df, base, quote):
+    base_vol = df[df['Currency'] == base]['OHLCVolatility'].mean()
+    quote_vol = df[df['Currency'] == quote]['OHLCVolatility'].mean()
+    return np.sqrt(base_vol**2 + quote_vol**2)
+
+# --- Simulate Shock ---
+def simulate_shock(base_threshold, shock_pct):
+    return base_threshold * (1 + shock_pct / 100)
+
+# --- Main App ---
+st.title("FX Volatility Monitoring Dashboard")
+df = load_data()
+
+tab1, tab2, tab3 = st.tabs(["Overview", "Cross-Pair Analysis", "Shock Simulation"])
+
+with tab1:
+    st.header("Volatility Distribution")
+    fig = px.histogram(df, x="OHLCVolatility", nbins=50, title="Annualized Volatility")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Manual Grouping")
+    df, manual_thresholds = manual_grouping(df)
+    st.dataframe(manual_thresholds.reset_index().rename(columns={"OHLCVolatility": "Manual Threshold"}))
+
+    st.subheader("Dynamic Threshold")
+    dyn_thresh = dynamic_threshold(df)
+    st.metric("Rolling 95th Percentile Threshold", f"{dyn_thresh:.4f}")
+
+with tab2:
+    st.header("Cross-Currency Pair Thresholding")
+    ccy_list = df['Currency'].unique().tolist()
+    base = st.selectbox("Base Currency", ccy_list, index=0)
+    quote = st.selectbox("Quote Currency", ccy_list, index=1)
+
+    cross_thresh = cross_pair_threshold(df, base, quote)
+    st.metric(f"{base}/{quote} Synthetic Threshold", f"{cross_thresh:.4f}")
+
+with tab3:
+    st.header("Shock Simulation")
+    shock = st.slider("Shock %", -50, 200, 0, step=10)
+    base = st.selectbox("Select Base for Shock", df['Currency'].unique(), index=0, key='shock_base')
+    quote = st.selectbox("Select Quote for Shock", df['Currency'].unique(), index=1, key='shock_quote')
+    base_val = cross_pair_threshold(df, base, quote)
+
+    shocked_val = simulate_shock(base_val, shock)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=["Original", "Shocked"],
+                             y=[base_val, shocked_val],
+                             mode='lines+markers',
+                             marker=dict(size=12),
+                             line=dict(width=3)))
+    fig.update_layout(title="Threshold Shock Impact",
+                      yaxis_title="Volatility Threshold",
+                      xaxis_title="Scenario")
+    st.plotly_chart(fig)
+
+    st.write(f"Original: {base_val:.4f} | Shocked: {shocked_val:.4f}")
