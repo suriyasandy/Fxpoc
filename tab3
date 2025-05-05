@@ -1,0 +1,47 @@
+# ────────────────────────────────────────────────────────────────────────────────
+#  🧠 ML & Consensus (Revised for Clarity)
+# ────────────────────────────────────────────────────────────────────────────────
+with tab3:
+    st.header("🧠 ML Anomalies & Consensus  —  Breach Comparison")
+
+    # 1) Compute breach‐rates
+    manual_breach    = (dfc['Vol'] > man_thr).mean()
+    dyn_alert_breach = (dfc['Vol'] > dfc['Thr_Alert']).mean()
+    dyn_evt_breach   = (dfc['Vol'] > dfc['Thr_Critical']).mean()
+    ml_breach        = feat_df['ML_Consensus'].mean()
+
+    st.subheader("Breach Rates")
+    rates = pd.Series({
+        'Manual Thr':    manual_breach,
+        'Dynamic Alert': dyn_alert_breach,
+        'Dynamic EVT':   dyn_evt_breach,
+        'ML Consensus':  ml_breach
+    })
+    st.bar_chart(rates)
+
+    # 2) Simplified ML Consensus line with thresholds as references
+    st.subheader("ML Consensus over Time")
+    fig = go.Figure()
+    # Consensus line
+    fig.add_trace(go.Scatter(
+        x=feat_df.index, y=feat_df['ML_Consensus'],
+        mode='lines', name='ML Consensus', line=dict(color='purple', width=2)
+    ))
+    # Reference breach‐rate lines
+    fig.add_hline(y=manual_breach,    line_dash='dot', line_color='black',  annotation_text="Manual",    annotation_position="top left")
+    fig.add_hline(y=dyn_alert_breach, line_dash='dot', line_color='orange', annotation_text="Dyn Alert",annotation_position="top left")
+    fig.add_hline(y=dyn_evt_breach,   line_dash='dot', line_color='red',    annotation_text="Dyn EVT",  annotation_position="top left")
+    fig.update_layout(
+        yaxis=dict(title='Breach Rate / Consensus Flag'),
+        xaxis_title="Date",
+        height=450
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 3) Clear business commentary
+    st.markdown("""
+    - **Bar Chart**: compares overall breach rates of each approach.  
+    - **ML Consensus** line: shows where ≥2 of 3 ML models flagged anomalies.  
+    - **Dotted lines** mark static vs dynamic breach rates for easy visual check.  
+    This single view makes it crystal‐clear how static/manual compares to dynamic and ML‐driven thresholds.
+    """)
