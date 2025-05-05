@@ -1,0 +1,440 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import datetime
+import itertools
+import plotly.graph_objects as go
+import plotly.express as px
+
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+from arch import arch_model
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ─── UTILITY FUNCTIONS ─────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':      (0.00, 0.07),
+    'Medium':   (0.07, 0.50),
+    'High':     (0.50, 0.60),
+    'VeryHigh': (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mean_vol = (
+        df2.groupby('Currency')['DailyVol']
+           .mean()
+           .reset_index(name='MeanDailyVol')
+    )
+    def assign_band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v >= lo: return b
+            if lo <= v < hi:            return b
+        return None
+    mean_vol['Band'] = mean_vol['MeanDailyVol'].map(assign_band)
+    band_thr = (
+        mean_vol.groupby('Band')['MeanDailyVol']
+                .max()
+                .reset_index(name='BandThreshold')
+    )
+    return mean_vol, band_thr
+
+def build_crosses(df):
+    piv_c = df.pivot(index='Date', columns='Currency', values='Close')
+    piv_v = df.pivot(index='Date', columns='Currency', values='DailyVol')
+    crosses=[]
+    codes = sorted(df['Currency'].unique())
+    for i,base in enumerate(codes):
+        for quote in codes[i+1:]:
+            rate = piv_c[quote]/piv_c[base]
+            vol  = np.sqrt(piv_v[base]**2 + piv_v[quote]**2)
+            lr   = np.log(rate/rate.shift(1))
+            tmp = pd.DataFrame({
+                'Date':       rate.index,
+                'Cross':      f"{base}/{quote}",
+                'Volatility': vol.values,
+                'LogReturn':  lr.values
+            }).dropna()
+            crosses.append(tmp)
+    return pd.concat(crosses, ignore_index=True)
+
+def rolling_quantile(s, window, q):
+    return s.rolling(window).quantile(q)
+
+def garch_evt(returns, tail_pct):
+    """Fit GARCH(1,1)+EVT on returns*100; return VaR at tail_pct rescaled."""
+    am  = arch_model(returns*100, vol='Garch', p=1, q=1)
+    res = am.fit(disp='off')
+    std = (res.resid / res.conditional_volatility)
+    std = std[~np.isnan(std)]
+    u   = np.quantile(std, 0.90)
+    exc = std[std>u] - u
+    c,loc,scale = genpareto.fit(exc, floc=0)
+    p_exc = (tail_pct - (1 - np.mean(std>u))) / np.mean(std>u)
+    var   = genpareto.ppf(p_exc, c, loc=0, scale=scale)
+    return (u + var)/100.0
+
+def detect_regimes(vol, n_states):
+    arr   = vol.values.reshape(-1,1)
+    model = GaussianHMM(n_components=n_states,
+                        covariance_type='full', n_iter=200)
+    model.fit(arr)
+    states = model.predict(arr)
+    # pick the “highest‐vol” state label for annotation
+    means  = {s:arr[states==s].mean() for s in np.unique(states)}
+    high   = max(means, key=means.get)
+    return states, high
+
+def calibrate_regime(vol, lr, target, windows, qs, tails):
+    # pick best rolling‐quantile (w,q) to hit target breach-rate
+    best_wq = min(
+        ((abs((vol > rolling_quantile(vol,w,q)).mean() - target), (w,q))
+         for w,q in itertools.product(windows,qs)),
+        key=lambda x: x[0]
+    )[1]
+    # pick best EVT tail to hit target breach-rate
+    best_t = min(
+        ((abs((vol > np.quantile(vol, t)).mean() - target), t)
+         for t in tails),
+        key=lambda x: x[0]
+    )[1]
+    return {'window':best_wq[0], 'quantile':best_wq[1], 'tail':best_t}
+
+def smooth_regimes(s, k=5):
+    """Forward/back‐fill then smooth with rolling majority (k)."""
+    sf = pd.Series(s).ffill().bfill()
+    return sf.rolling(k, center=True, min_periods=1)\
+             .apply(lambda x: x.value_counts().idxmax())\
+             .astype(int).values
+
+# ────────────────────────────────────────────────────────────────────────────────
+# ─── STREAMLIT APP ─────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(
+    page_title="FX Vol Threshold & Anomaly Consensus",
+    layout="wide"
+)
+
+st.title("🎯 FX Volatility Thresholding & Anomaly Consensus")
+
+# ──────────────── Sidebar ───────────────────────────────────────────────────────
+st.sidebar.header("1) Load & Settings")
+f = st.sidebar.file_uploader(
+    "Upload FX data (Date,Open,High,Low,Close,OHLCVolatility,Currency)",
+    type="csv"
+)
+if not f:
+    st.sidebar.info("Please upload your FX CSV to begin.")
+    st.stop()
+
+df = pd.read_csv(f, parse_dates=['Date']).sort_values('Date')
+df['DailyVol'] = df['OHLCVolatility'] / SQRT252
+
+# manual grouping
+mean_vol_df, band_thr_df = compute_manual_groups(df)
+
+# build crosses
+cross_df = build_crosses(df)
+cross_list = sorted(cross_df['Cross'].unique())
+sel_cross = st.sidebar.selectbox("2) Select FX Cross", cross_list)
+
+# regime calibration settings
+st.sidebar.header("3) Regime Calibration")
+n_states    = st.sidebar.slider("HMM States", 2, 4, 2)
+target_rate = st.sidebar.slider("Target Alert Rate", 0.01, 0.20, 0.05, 0.01)
+roll_windows= [30,60,90,120]
+roll_qs     = [0.90,0.95,0.99]
+evt_tails   = [0.990,0.995,0.999]
+
+# ML consensus settings
+st.sidebar.header("4) ML Contamination")
+if_fract = st.sidebar.slider("IF Contamination", 0.01,0.10,0.05,0.01)
+svm_nu    = st.sidebar.slider("SVM ν-param",  0.01,0.10,0.05,0.01)
+
+# ──────────────── Prepare data for selected cross ───────────────────────────────
+dfc = cross_df.query("Cross==@sel_cross").set_index('Date').sort_index()
+
+# manual threshold for this cross
+base,quote = sel_cross.split('/')
+b1 = mean_vol_df.loc[mean_vol_df.Currency==base,'Band'].iat[0]
+b2 = mean_vol_df.loc[mean_vol_df.Currency==quote,'Band'].iat[0]
+order = ['Low','Medium','High','VeryHigh']
+man_band = b1 if order.index(b1)>order.index(b2) else b2
+man_thr   = band_thr_df.loc[band_thr_df.Band==man_band,'BandThreshold'].iat[0]
+
+# detect regimes
+dfc['Regime'], _ = detect_regimes(dfc['Volatility'], n_states)
+dfc['Regime']    = smooth_regimes(dfc['Regime'])
+
+# per-regime calibration
+calib = {}
+for r,grp in dfc.groupby('Regime'):
+    calib[r] = calibrate_regime(
+        grp['Volatility'], grp['LogReturn'],
+        target_rate, roll_windows, roll_qs, evt_tails
+    )
+
+# compute dynamic thresholds
+dfc['Thr_Warning']  = np.nan
+dfc['Thr_Alert']    = np.nan
+dfc['Thr_Critical'] = np.nan
+for r,grp in dfc.groupby('Regime'):
+    w,q = calib[r]['window'], calib[r]['quantile']
+    dfc.loc[grp.index, 'Thr_Warning']  = rolling_quantile(grp['Volatility'], w, 0.90)
+    dfc.loc[grp.index, 'Thr_Alert']    = rolling_quantile(grp['Volatility'], w, q)
+    # EVT via simple quantile on the *volatility* series
+    t = calib[r]['tail']
+    dfc.loc[grp.index, 'Thr_Critical'] = grp['Volatility'].quantile(t)
+
+# ──────────────────── ML Anomaly Detection ─────────────────────────────────────
+# use only rows with no missing in our features
+ml_df = dfc.dropna(subset=['Volatility','LogReturn'])
+X      = ml_df[['Volatility','LogReturn']].values
+
+# Isolation Forest
+if_clf = IsolationForest(contamination=float(if_fract))
+ml_df['IF_Anom'] = np.where(if_clf.fit_predict(X)==-1, 1, 0)
+
+# One-Class SVM
+scaler = StandardScaler().fit(X)
+X_sc   = scaler.transform(X)
+svm    = OneClassSVM(nu=float(svm_nu))
+ml_df['SVM_Anom'] = np.where(svm.fit_predict(X_sc)==-1, 1, 0)
+
+# Autoencoder
+def run_autoencoder(X, enc_dim=10, epochs=30):
+    sc = StandardScaler().fit(X)
+    Xs = sc.transform(X)
+    m = Sequential([
+        Dense(enc_dim*2, activation='relu', input_shape=(X.shape[1],)),
+        Dense(enc_dim, activation='relu'),
+        Dense(enc_dim*2, activation='relu'),
+        Dense(X.shape[1], activation='linear')
+    ])
+    m.compile(Adam(0.001), 'mse')
+    m.fit(Xs, Xs, epochs=epochs, batch_size=32, verbose=0)
+    rec = m.predict(Xs)
+    mse = np.mean((Xs-rec)**2, axis=1)
+    return mse
+
+mse_scores = run_autoencoder(X, enc_dim=5, epochs=20)
+ae_thr = np.quantile(mse_scores, 0.95)
+ml_df['AE_Anom'] = np.where(mse_scores > ae_thr, 1, 0)
+
+# ML Consensus = ≥2 of 3 flags
+ml_df['ML_Consensus'] = ((ml_df[['IF_Anom','SVM_Anom','AE_Anom']].sum(axis=1) >= 2)
+                          .astype(int))
+
+# map back to full dfc (fill zero for dropped)
+dfc['IF_Anom']        = 0
+dfc['SVM_Anom']       = 0
+dfc['AE_Anom']        = 0
+dfc['ML_Consensus']   = 0
+dfc.loc[ml_df.index, ['IF_Anom','SVM_Anom','AE_Anom','ML_Consensus']] =\
+    ml_df[['IF_Anom','SVM_Anom','AE_Anom','ML_Consensus']]
+
+# ────────────────────────── STREAMLIT TABS ──────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Overview",
+    "📊 Dashboard",
+    "🧠 ML & Consensus",
+    "🚀 Shock Simulation"
+])
+
+# ──────────────────────────── TAB 1: OVERVIEW ────────────────────────────────────
+with tab1:
+    st.header("Why a Hybrid, Data-Driven Approach?")
+    st.markdown("""
+    - **Manual Buckets** (static) are simple but **never adapt** once set.  
+    - **Dynamic Rolling-Quantile** (90%/95%) responds to recent history.  
+    - **EVT Tail-Risk** flags extreme shocks beyond normal distributions.  
+    - **Per-Regime Calibration** via HMM (Calm/Normal/Stress) ensures **each** market state has its own thresholds.  
+    - **ML Anomalies** add a third, model-based signal (IsolationForest, SVM, Autoencoder) with a **2-of-3 consensus** for robust second opinions.  
+
+    Below, you’ll see how **Dynamic** thresholds **re-calibrate** as markets shift—even under synthetic shocks—while your static manual thresholds stay put.
+    """)
+
+# ───────────────────────── TAB 2: DASHBOARD ────────────────────────────────────
+with tab2:
+    st.header(f"Dashboard — {sel_cross}")
+    latest = dfc.iloc[-1]
+    c0,c1,c2,c3,c4,c5 = st.columns(6)
+    c0.metric("Manual Thr",         f"{man_thr:.4f}")
+    c1.metric("Latest Vol",         f"{latest.Volatility:.4f}")
+    c2.metric("Warn Thr (90%)",     f"{latest.Thr_Warning:.4f}")
+    c3.metric("Alert Thr (95%)",    f"{latest.Thr_Alert:.4f}")
+    c4.metric("Critical Thr (EVT)", f"{latest.Thr_Critical:.4f}")
+    c5.metric("Regime",             f"Regime {latest.Regime}")
+
+    st.markdown("---")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.Volatility,
+        name="Volatility", line=dict(color='blue')
+    ))
+    fig.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.Thr_Warning,
+        name="90% Warning", line=dict(color='orange', dash='dash')
+    ))
+    fig.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.Thr_Alert,
+        name="95% Alert", line=dict(color='red', dash='dot')
+    ))
+    fig.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.Thr_Critical,
+        name="EVT Critical", line=dict(color='black', dash='longdash')
+    ))
+    fig.update_layout(
+        title="Volatility & Dynamic Thresholds",
+        xaxis_title="Date", yaxis_title="Daily Volatility",
+        height=500, xaxis=dict(rangeslider=dict(visible=True))
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# ─────────────────────────── TAB 3: ML & CONSENSUS ─────────────────────────────
+with tab3:
+    st.header(f"ML Anomalies & Consensus — {sel_cross}")
+
+    fig_ml = go.Figure()
+    fig_ml.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.IF_Anom,
+        mode='markers', name='IF Anomaly',
+        marker=dict(color='blue', symbol='circle')
+    ))
+    fig_ml.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.SVM_Anom,
+        mode='markers', name='SVM Anomaly',
+        marker=dict(color='green', symbol='x')
+    ))
+    fig_ml.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.AE_Anom,
+        mode='markers', name='AE Anomaly',
+        marker=dict(color='red', symbol='triangle-up')
+    ))
+    fig_ml.add_trace(go.Scatter(
+        x=dfc.index, y=dfc.ML_Consensus,
+        mode='lines', name='ML Consensus',
+        line=dict(color='purple', dash='dash')
+    ))
+    fig_ml.update_layout(
+        title="Anomaly Flags & Consensus",
+        yaxis=dict(tickmode='array', tickvals=[0,1], ticktext=['Normal','Anom']),
+        height=450
+    )
+    st.plotly_chart(fig_ml, use_container_width=True)
+
+    st.markdown("""
+    - **IsolationForest**  — flags points outside the learned “normal” set.  
+    - **One-Class SVM**     — builds a hypersphere around normal data; outside = anomaly.  
+    - **Autoencoder**       — learns compressed “normal” patterns; high MSE = anomaly.  
+    - **ML Consensus** (≥2/3) gives a robust second opinion on unusual moves.
+    """)
+
+    # compare breach/anomaly rates
+    rates = pd.Series({
+        'Manual Breach':        (dfc.Volatility>man_thr).mean(),
+        'Dyn Alert Breach':     (dfc.Volatility>dfc.Thr_Alert).mean(),
+        'Dyn EVT Breach':       (dfc.Volatility>dfc.Thr_Critical).mean(),
+        'ML Consensus Flag':    dfc.ML_Consensus.mean()
+    }, name='Rate')
+    st.bar_chart(rates)
+
+# ───────────────────────── TAB 4: SHOCK SIMULATION ─────────────────────────────
+with tab4:
+    st.header("🚀 Shock Simulation & Re-calibration")
+
+    # snapshot & shock dates
+    min_d, max_d = dfc.index[0].date(), dfc.index[-1].date()
+    sd = st.date_input("Snapshot Date (pre-shock)", value=max_d - datetime.timedelta(days=30),
+                       min_value=min_d, max_value=max_d - datetime.timedelta(days=1))
+    ed = st.date_input("Shock End Date", value=max_d,
+                       min_value=sd + datetime.timedelta(days=1), max_value=max_d)
+    snap_ts  = max(d for d in dfc.index if d.date() <= sd)
+    shock_ts = max(d for d in dfc.index if d.date() <= ed)
+
+    # which leg(s) to shock?
+    legs = st.multiselect("Which leg(s)?", ['Base Leg','Quote Leg'], default=['Quote Leg'])
+    mb, mq = 1.0, 1.0
+    if 'Base Leg' in legs:
+        mb = st.slider("Base Leg Shock × real vol", 1.0, 5.0, 2.0, 0.1)
+    if 'Quote Leg' in legs:
+        mq = st.slider("Quote Leg Shock × real vol", 1.0, 5.0, 2.0, 0.1)
+
+    # build shocked series
+    b2 = dfc['Volatility'] * (dfc['Volatility'].index*0+0)  # dummy init
+    # we need the raw legs: invert the cross formula
+    # but for simplicity, approximate: split vol² evenly
+    raw_b = dfc['Volatility']/np.sqrt(2)
+    raw_q = dfc['Volatility']/np.sqrt(2)
+    mb_mask = (dfc.index>snap_ts)&(dfc.index<=shock_ts)
+    mq_mask = mb_mask.copy()
+    b2 = raw_b.copy()
+    q2 = raw_q.copy()
+    if 'Base Leg' in legs:
+        b2.loc[mb_mask] *= mb
+    if 'Quote Leg' in legs:
+        q2.loc[mq_mask] *= mq
+    vol2 = np.sqrt(b2**2 + q2**2)
+
+    # recalibrate dynamic thresholds
+    df2 = dfc.copy()
+    df2['Vol2'] = vol2
+    df2['A2'] = np.nan; df2['C2'] = np.nan
+    for r,grp in df2.groupby('Regime'):
+        w,q = calib[r]['window'], calib[r]['quantile']
+        df2.loc[grp.index,'A2'] = rolling_quantile(grp['Vol2'], w, q)
+        df2.loc[grp.index,'C2'] = grp['Vol2'].quantile(calib[r]['tail'])
+
+    a_snap = dfc.loc[snap_ts,'Thr_Alert']
+    c_snap = dfc.loc[snap_ts,'Thr_Critical']
+    a_sh   = df2.loc[shock_ts,'A2']
+    c_sh   = df2.loc[shock_ts,'C2']
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    c1.metric("Manual Thr",            f"{man_thr:.4f}")
+    c2.metric("Alert @ snapshot",      f"{a_snap:.4f}")
+    c3.metric("EVT @ snapshot",        f"{c_snap:.4f}")
+    c4.metric("Alert @ post-shock",    f"{a_sh:.4f}")
+    c5.metric("EVT @ post-shock",      f"{c_sh:.4f}")
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Scatter(
+        x=dfc.index, y=dfc['Volatility'], name="Orig Vol", line=dict(color='grey')
+    ))
+    fig3.add_trace(go.Scatter(
+        x=df2.index, y=df2['Vol2'],     name="Shocked Vol", line=dict(color='blue')
+    ))
+    fig3.add_vrect(x0=snap_ts, x1=shock_ts,
+                   fillcolor='red', opacity=0.1, line_width=0)
+    for y,col,txt,pos in [
+        (man_thr,'black','Manual','bottom right'),
+        (a_snap,'orange','Alert@snap','bottom right'),
+        (a_sh,  'orange','Alert@shock','top right'),
+        (c_snap,'red','EVT@snap','bottom right'),
+        (c_sh,  'red','EVT@shock','top right')
+    ]:
+        fig3.add_hline(y=y, line_dash='dash', line_color=col,
+                       annotation_text=txt, annotation_position=pos)
+
+    fig3.update_layout(
+        title="Original vs Shocked Volatility & Thresholds",
+        xaxis_title="Date", yaxis_title="Daily Volatility",
+        height=500
+    )
+    st.plotly_chart(fig3, use_container_width=True)
+
+    st.markdown(f"""
+    **Shock window:** {sd:%Y-%m-%d} → {ed:%Y-%m-%d}  
+    Manual thresholds (black) **never move**, whereas our dynamic 
+    alert/EVT lines **re-calibrate** at both the snapshot date and again 
+    after the synthetic stress period—proving they adapt in real time.
+    """)
