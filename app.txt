@@ -1,0 +1,274 @@
+# app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import itertools, datetime
+from pandas.tseries.offsets import BDay
+from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
+import plotly.express as px
+import plotly.graph_objects as go
+from arch import arch_model
+from scipy.stats import genpareto
+from hmmlearn.hmm import GaussianHMM
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  UTILITIES
+# ────────────────────────────────────────────────────────────────────────────────
+
+SQRT252 = np.sqrt(252)
+MANUAL_BANDS = {
+    'Low':      (0.00, 0.07),
+    'Medium':   (0.07, 0.50),
+    'High':     (0.50, 0.60),
+    'VeryHigh': (0.60, None)
+}
+
+def compute_manual_groups(df):
+    df2 = df.copy()
+    df2['DailyVol'] = df2['OHLCVolatility'] / SQRT252
+    mv = (df2.groupby('Currency')['DailyVol']
+           .mean().reset_index(name='MeanDailyVol'))
+    def band(v):
+        for b,(lo,hi) in MANUAL_BANDS.items():
+            if hi is None and v>=lo: return b
+            if lo<=v<hi:            return b
+        return None
+    mv['Band']=mv['MeanDailyVol'].map(band)
+    bt = (mv.groupby('Band')['MeanDailyVol']
+           .max().reset_index(name='BandThreshold'))
+    return mv, bt
+
+def rolling_quantile(s,w,q): return s.rolling(w).quantile(q)
+
+def evt_vol_threshold(vol,u_pct=0.90,tail_pct=0.995):
+    u = vol.quantile(u_pct)
+    exc = vol[vol>u] - u
+    if exc.empty: return u
+    c,loc,scale = genpareto.fit(exc, floc=0)
+    p_exc = (1-tail_pct)/(1-u_pct)
+    var = genpareto.ppf(1-p_exc, c, loc=0, scale=scale)
+    return u+var
+
+def detect_regimes(vol,n_states):
+    clean = vol.replace([np.inf,-np.inf],np.nan).dropna()
+    if clean.empty:
+        return np.zeros(len(vol),int),0,np.nan
+    arr = clean.values.reshape(-1,1)
+    m = GaussianHMM(n_components=n_states,covariance_type='full',n_iter=200)
+    m.fit(arr)
+    raw = m.predict(arr)
+    means={s:arr[raw==s].mean() for s in np.unique(raw)}
+    high= max(means,key=means.get)
+    s = pd.Series(raw,index=clean.index)
+    full=s.reindex(vol.index).ffill().bfill().astype(int)
+    return full.values,high,means[high]
+
+def smooth_regimes(raw,min_run=5):
+    s=pd.Series(raw)
+    runs=(s!=s.shift()).cumsum()
+    lengths=s.groupby(runs).transform('size')
+    s[lengths<min_run]=np.nan
+    f=s.ffill().bfill()
+    return f.astype(int).values if not f.isna().any() else raw
+
+def calibrate_regime(vol,lr,target,windows,qs,tails):
+    best_wq=min(
+        ((abs((vol>rolling_quantile(vol,w,q)).mean()-target),(w,q))
+         for w,q in itertools.product(windows,qs)),
+        key=lambda x:x[0])[1]
+    best_t=min(
+        ((abs((vol>evt_vol_threshold(vol,0.90,t)).mean()-target),t)
+         for t in tails),
+        key=lambda x:x[0])[1]
+    return {'window':best_wq[0],'quantile':best_wq[1],'tail':best_t}
+
+def build_features(vol_series):
+    df=pd.DataFrame({'Vol':vol_series})
+    df['LogRet']=np.log(df['Vol']/df['Vol'].shift(1))
+    for w in [7,14,30]:
+        df[f'Vol_MA_{w}']=df['Vol'].rolling(w).mean()
+        df[f'Vol_STD_{w}']=df['Vol'].rolling(w).std()
+    df.dropna(inplace=True)
+    return df
+
+def fit_autoencoder(X,encoding_dim=5,epochs=20):
+    scaler=StandardScaler(); Xs=scaler.fit_transform(X)
+    model=Sequential([
+        Dense(encoding_dim*2,activation='relu',input_shape=(X.shape[1],)),
+        Dense(encoding_dim,activation='relu'),
+        Dense(encoding_dim*2,activation='relu'),
+        Dense(X.shape[1],activation='linear')
+    ])
+    model.compile(Adam(0.001),'mse')
+    model.fit(Xs,Xs,epochs=epochs,batch_size=32,verbose=0)
+    rec=model.predict(Xs)
+    mse=np.mean((Xs-rec)**2,axis=1)
+    return mse,scaler
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  STREAMLIT APP
+# ────────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="FX Vol PoC",layout="wide")
+st.title("🎯 FX Volatility Thresholding & Anomaly Consensus")
+
+# Sidebar
+st.sidebar.header("1) Upload FX Data")
+f=st.sidebar.file_uploader("CSV(Date,Open,High,Low,Close,OHLCVolatility,Currency)",type="csv")
+if not f: st.sidebar.info("Awaiting data…"); st.stop()
+df=pd.read_csv(f,parse_dates=['Date']).sort_values(['Currency','Date'])
+df['DailyVol']=df['OHLCVolatility']/SQRT252
+
+mv_df,bt_df=compute_manual_groups(df)
+pivot=df.pivot(index='Date',columns='Currency',values='DailyVol')
+codes=sorted(pivot.columns)
+crosses=[f"{a}/{b}" for i,a in enumerate(codes) for b in codes[i+1:]]
+sel_cross=st.sidebar.selectbox("2) FX Cross",crosses)
+base,quote=sel_cross.split('/')
+
+n_states=st.sidebar.slider("3) HMM States",2,4,2)
+st.sidebar.header("4) Calibration Target")
+target_rate=st.sidebar.slider("Alert Rate",0.01,0.20,0.05,0.01)
+roll_windows=[30,60,90,120]; roll_qs=[0.90,0.95,0.99]; evt_tails=[0.990,0.995,0.999]
+st.sidebar.header("5) Display & Consensus")
+tiers=st.sidebar.multiselect("Tiers",['Warning','Alert','Critical'],default=['Alert'])
+cons_frac=st.sidebar.slider("Consensus Fraction",0.1,1.0,0.5,0.05)
+
+# Prepare series
+b_ser=df[df.Currency==base].set_index('Date')['DailyVol']
+q_ser=df[df.Currency==quote].set_index('Date')['DailyVol']
+idx=b_ser.index.intersection(q_ser.index)
+cross_vol=np.sqrt(b_ser.loc[idx]**2+q_ser.loc[idx]**2)
+cross_lr=np.log(
+    df[df.Currency==quote].set_index('Date')['Close'].loc[idx]/
+    df[df.Currency==base].set_index('Date')['Close'].loc[idx]
+)
+
+# regimes
+rb,_,_=detect_regimes(b_ser,n_states)
+rq,_,_=detect_regimes(q_ser,n_states)
+rx,_,_=detect_regimes(cross_vol,n_states)
+sb=smooth_regimes(rb); sq=smooth_regimes(rq); sx=smooth_regimes(rx)
+
+# Cross DataFrame
+dfc=pd.DataFrame({
+    'Vol':cross_vol,
+    'LogRet':cross_lr,
+    'Regime':sx
+},index=idx)
+dfc['Label']=dfc.Regime.map(lambda x:f"Regime {x}")
+
+# Manual threshold for this cross
+b1=mv_df.set_index('Currency')['Band'][base]
+b2=mv_df.set_index('Currency')['Band'][quote]
+order=['Low','Medium','High','VeryHigh']
+mgroup=b1 if order.index(b1)>order.index(b2) else b2
+man_thr=bt_df.set_index('Band')['BandThreshold'][mgroup]
+
+# Per-regime calibration
+calib={}
+for r,grp in dfc.groupby('Regime'):
+    lr=grp.LogRet.dropna().values
+    calib[r]=calibrate_regime(grp.Vol,lr,target_rate,roll_windows,roll_qs,evt_tails)
+
+# Compute dynamic thresholds
+dfc['Thr_Warning']=np.nan; dfc['Thr_Alert']=np.nan
+for r,grp in dfc.groupby('Regime'):
+    w=calib[r]['window']; q=calib[r]['quantile']
+    dfc.loc[grp.index,'Thr_Warning']=rolling_quantile(grp['Vol'],w,0.90)
+    dfc.loc[grp.index,'Thr_Alert']  =rolling_quantile(grp['Vol'],w,q)
+dfc['Thr_Critical']=dfc.Regime.map(
+    lambda r: evt_vol_threshold(dfc[dfc.Regime==r]['Vol'],0.90,calib[r]['tail'])
+)
+
+# Consensus on dynamic tiers
+flags=pd.DataFrame({
+    'Alert':   (dfc.Vol>dfc.Thr_Alert).astype(int),
+    'Critical':(dfc.Vol>dfc.Thr_Critical).astype(int)
+},index=dfc.index)
+flags['Dyn_Consensus']=(flags.sum(axis=1)/2>=cons_frac).astype(int)
+
+# ────────────────────────────────────────────────────────────────────────────────
+#  Tabs
+# ────────────────────────────────────────────────────────────────────────────────
+
+tab1,tab2,tab3 = st.tabs(["📋 Overview","📊 Dashboard","🧠 ML & Consensus"])
+
+# Overview
+with tab1:
+    st.header("Why Hybrid Dynamic + ML Consensus?")
+    st.markdown("""
+    - **Manual Buckets** give a quick static policy, but *cannot adapt* when vol regimes shift.
+    - **Hybrid Dynamic** uses per-regime rolling quantiles (90%/95%) + EVT tail-risk for *self-correcting* thresholds.
+    - **ML Anomaly Detectors** (IsolationForest, OCSVM, Autoencoder) pick up *unusual patterns* beyond pure-vol shock.
+    - **Consensus Voting** across the four signals (Rolling, EVT, IF, OCSVM, AE) *reduces false alarms*.
+    """)
+
+# Dashboard (thresholds)
+with tab2:
+    st.header(f"Threshold Dashboard — {sel_cross}")
+    c0,c1,c2,c3,c4,c5 = st.columns(6)
+    c0.metric("Manual Thr",     f"{man_thr:.4f}")
+    c1.metric("Latest Vol",     f"{dfc['Vol'][-1]:.4f}")
+    c2.metric("Warning Thr",    f"{dfc['Thr_Warning'][-1]:.4f}")
+    c3.metric("Alert Thr",      f"{dfc['Thr_Alert'][-1]:.4f}")
+    c4.metric("Critical Thr",   f"{dfc['Thr_Critical'][-1]:.4f}")
+    c5.metric("Dyn Consensus",  f"{flags.Dyn_Consensus.mean():.1%}")
+
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=dfc.index,y=dfc['Vol'],name='Vol',line=dict(color='blue')))
+    if 'Warning'in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index,y=dfc['Thr_Warning'],name='Warning',line=dict(dash='dash')))
+    if 'Alert'in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index,y=dfc['Thr_Alert'],  name='Alert',line=dict(dash='dot')))
+    if 'Critical'in tiers:
+        fig.add_trace(go.Scatter(x=dfc.index,y=dfc['Thr_Critical'],name='Critical',line=dict(dash='longdash')))
+    fig.update_layout(xaxis=dict(rangeslider=dict(visible=True)),yaxis_title="Volatility")
+    st.plotly_chart(fig,use_container_width=True)
+
+# ML & Consensus
+with tab3:
+    st.header("🧠 ML Anomalies & Consensus")
+
+    # Build features
+    feat_df = build_features(dfc['Vol'])
+    X = feat_df.drop(columns=['LogRet']).fillna(0).values
+
+    # Isolation Forest
+    ifr = IsolationForest(contamination=target_rate,random_state=0)
+    feat_df['IF_Score']  = ifr.fit_predict(X)*-1  # 1=anomaly
+    feat_df['IF_Prob']   = ifr.decision_function(X)
+
+    # One-Class SVM
+    svm = OneClassSVM(nu=target_rate, kernel='rbf', gamma='auto')
+    feat_df['SVM_Score'] = svm.fit_predict(X)*-1
+
+    # Autoencoder
+    ae_mse,ae_scaler = fit_autoencoder(X,encoding_dim=3,epochs=30)
+    thresh = np.quantile(ae_mse,0.95)
+    feat_df['AE_Score'] = (ae_mse>thresh).astype(int)
+
+    # Consensus across ML signals
+    feat_df['ML_Consensus'] = (feat_df[['IF_Score','SVM_Score','AE_Score']].sum(axis=1) >= 2).astype(int)
+
+    # Plot anomaly flags
+    fig2=go.Figure()
+    fig2.add_trace(go.Scatter(x=feat_df.index, y=feat_df['IF_Score'],  mode='markers',name='IF Anomaly'))
+    fig2.add_trace(go.Scatter(x=feat_df.index, y=feat_df['SVM_Score'], mode='markers',name='SVM Anomaly'))
+    fig2.add_trace(go.Scatter(x=feat_df.index, y=feat_df['AE_Score'],  mode='markers',name='AE Anomaly'))
+    fig2.add_trace(go.Scatter(x=feat_df.index, y=feat_df['ML_Consensus'],mode='lines',  name='ML Consensus'))
+    fig2.update_layout(yaxis_title="Anomaly Flag (1=anomaly)",height=450)
+    st.plotly_chart(fig2,use_container_width=True)
+
+    st.markdown("""
+    - **IsolationForest** flags points that lie outside the learned “normal” volatility patterns.  
+    - **One-Class SVM** finds a hypersphere around normal data; outside = anomaly.  
+    - **Autoencoder** learns a compressed reconstruction; high MSE = anomaly.  
+    - **ML Consensus** (≥2/3) gives a robust second opinion on unusual moves.
+    """)
